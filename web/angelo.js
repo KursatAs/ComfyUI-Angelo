@@ -295,7 +295,7 @@ app.registerExtension({
                 };
                 seedCtrlW._AngeloPrevValue = seedCtrlW.value;
             }
-            const min = [340, 540];
+            const min = [340, 680];
             if (this.size[0] < min[0]) this.size[0] = min[0];
             if (this.size[1] < min[1]) this.size[1] = min[1];
         };
@@ -1103,8 +1103,15 @@ function attachPreviewCanvas(node) {
         event.stopPropagation();   // don't also zoom the ComfyUI graph
         const wrapW = canvasWrap.clientWidth, wrapH = canvasWrap.clientHeight;
         const wrapRect = canvasWrap.getBoundingClientRect();
-        const cx = event.clientX - wrapRect.left;
-        const cy = event.clientY - wrapRect.top;
+        // Convert cursor from viewport/visual pixels to layout pixels.
+        // ComfyUI applies a CSS transform (scale) on the graph container;
+        // getBoundingClientRect() reflects that scale while clientWidth does
+        // not. Without this correction the cursor coordinate is wrong when
+        // the graph is zoomed, causing the image to drift sideways on wheel.
+        const graphScaleX = wrapRect.width > 0 ? wrapRect.width / wrapW : 1;
+        const graphScaleY = wrapRect.height > 0 ? wrapRect.height / wrapH : 1;
+        const cx = (event.clientX - wrapRect.left) / graphScaleX;
+        const cy = (event.clientY - wrapRect.top) / graphScaleY;
         const oldZoom = node._AngeloZoom || 1;
         const factor = event.deltaY < 0 ? 1.15 : (1 / 1.15);
         const newZoom = Math.max(0.25, Math.min(8, oldZoom * factor));
@@ -1492,7 +1499,7 @@ function attachPreviewCanvas(node) {
     const widget = node.addDOMWidget("Angelo_preview_canvas", "Angelo_canvas", container, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => 320,
+        getMinHeight: () => 520,
     });
 
     // Make the preview widget fill the node's full width.
