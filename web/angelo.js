@@ -1492,14 +1492,25 @@ function attachPreviewCanvas(node) {
     });
 
     // Add as a DOM widget on the node so LiteGraph manages its layout.
-    // getMinHeight floors the DOM-widget area; the toolbar now spans 4
-    // rows so we give the canvas a sensible minimum below it. The canvas
-    // itself scales to fill whatever space is left (fitCanvasDisplaySize),
-    // so resizing the node taller just grows the image.
+    // getMinHeight is now aspect-ratio aware: it returns enough height for
+    // the toolbar PLUS a canvas that fits the current image at the node's
+    // width, clamped between _PREVIEW_MIN_CANVAS_H and _PREVIEW_MAX_H.
+    // When no image is loaded yet a sensible placeholder height is used.
     const widget = node.addDOMWidget("Angelo_preview_canvas", "Angelo_canvas", container, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => 520,
+        getMinHeight: () => {
+            const img = node._AngeloImg;
+            if (!img || !img.naturalWidth || !img.naturalHeight) {
+                return _TOOLBAR_H_APPROX + _PREVIEW_MIN_CANVAS_H;
+            }
+            // Derive ideal canvas height from image AR and current node width.
+            const nodeW = Math.max(1, (node.size ? node.size[0] : 380) - 12);
+            const ar = img.naturalHeight / img.naturalWidth;
+            const idealCanvasH = Math.round(Math.min(nodeW, _PREVIEW_MAX_W) * ar);
+            const canvasH = Math.max(_PREVIEW_MIN_CANVAS_H, Math.min(_PREVIEW_MAX_H, idealCanvasH));
+            return _TOOLBAR_H_APPROX + canvasH;
+        },
     });
 
     // Make the preview widget fill the node's full width.
@@ -1557,6 +1568,22 @@ function _angeloIsZoomed(node) {
         || (node._AngeloPanY || 0) !== 0;
 }
 
+// ── Preview size limits ─────────────────────────────────────────────────
+// _PREVIEW_MAX_W / _PREVIEW_MAX_H: the largest the canvas is ever displayed
+// (display pixels, not intrinsic). Prevents the preview from dominating the
+// screen when the node is made large or the latent is very high-resolution.
+//
+// _PREVIEW_MIN_CANVAS_H: minimum canvas height used in getMinHeight(). Keeps
+// the painting area usable even for very wide (landscape) latents.
+//
+// _TOOLBAR_H_APPROX: rough height of the toolbar rows that sit above the
+// canvas. Used by getMinHeight() to compute a correct total widget height.
+// ────────────────────────────────────────────────────────────────────────
+const _PREVIEW_MAX_W       = 768;
+const _PREVIEW_MAX_H       = 560;
+const _PREVIEW_MIN_CANVAS_H = 260;
+const _TOOLBAR_H_APPROX    = 190;
+
 // Compute the BASE (fit) display size: the canvas size at zoom=1, fitting
 // the wrap while preserving aspect ratio. Stored as _AngeloBaseW/H; the
 // live size is base × zoom, applied by applyView().
@@ -1564,6 +1591,10 @@ function _angeloIsZoomed(node) {
 // IMPORTANT: when the user has zoomed/panned (zoom != 1 or pan != 0), this
 // is a NO-OP — the auto-fit must not stomp on a manual zoom. The view only
 // re-fits at the neutral state (e.g. after resetView or a new image).
+//
+// A hard cap (_PREVIEW_MAX_W × _PREVIEW_MAX_H) prevents the preview from
+// growing huge when the node is made very large, while still respecting
+// the available wrap space (whichever limit is smaller wins).
 function fitCanvasDisplaySize(node) {
     if (_angeloIsZoomed(node)) return;   // never auto-fit while zoomed/panned
     const canvas = node._AngeloCanvas;
@@ -1576,7 +1607,11 @@ function fitCanvasDisplaySize(node) {
     const natW = (img && img.naturalWidth) ? img.naturalWidth : canvas.width;
     const natH = (img && img.naturalHeight) ? img.naturalHeight : canvas.height;
     if (natW <= 0 || natH <= 0) return;
-    const scale = Math.min(availW / natW, availH / natH);
+    // Scale to fit the available wrap space, then additionally cap at the
+    // max display dimensions so a large node never shows an enormous preview.
+    const scaleToFit = Math.min(availW / natW, availH / natH);
+    const scaleToCap = Math.min(_PREVIEW_MAX_W / natW, _PREVIEW_MAX_H / natH);
+    const scale = Math.min(scaleToFit, scaleToCap);
     node._AngeloBaseW = Math.max(1, Math.floor(natW * scale));
     node._AngeloBaseH = Math.max(1, Math.floor(natH * scale));
     applyView(node);
@@ -1994,6 +2029,26 @@ function loadIntoCanvas(node, url) {
             applyView(node);
         } else {
             resetView(node);
+        }
+
+        // Auto-resize the node height to suit the image aspect ratio so the
+        // canvas is always a comfortable size to paint on.  We only do this
+        // when the image dimensions change (new generation / first load) —
+        // mid-refine updates to the same-size canvas keep whatever height the
+        // user has set.  The target height is:
+        //   LiteGraph node title (~32 px) + toolbar + clamped canvas height
+        // where the canvas height mirrors the logic in getMinHeight().
+        if (!sameDims) {
+            const nodeW = node.size ? node.size[0] : 380;
+            const contentW = Math.max(1, nodeW - 12);  // subtract side margins
+            const ar = img.naturalHeight / img.naturalWidth;
+            const idealCanvasH = Math.round(Math.min(contentW, _PREVIEW_MAX_W) * ar);
+            const canvasH = Math.max(_PREVIEW_MIN_CANVAS_H, Math.min(_PREVIEW_MAX_H, idealCanvasH));
+            // +32 for the LiteGraph node title bar; +8 extra breathing room.
+            const idealNodeH = _TOOLBAR_H_APPROX + canvasH + 40;
+            const newH = Math.max(480, Math.min(960, idealNodeH));
+            if (!node.size) node.size = [nodeW, newH];
+            else if (Math.abs(node.size[1] - newH) > 30) node.size[1] = newH;
         }
 
         // If we're in detect mode (candidates persist for batch editing),
