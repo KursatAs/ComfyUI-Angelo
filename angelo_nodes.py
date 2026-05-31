@@ -23,11 +23,17 @@ The cache is in-process state only — restart of ComfyUI clears it.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import math
 import os
+import threading
+
+import numpy as np
 import torch
+from PIL import Image as _PILImage, ImageDraw as _PILImageDraw, ImageOps as _PILImageOps
 
 import comfy.sample
 import comfy.samplers
@@ -52,6 +58,24 @@ import nodes as comfy_nodes
 #     "fingerprint": str,          # hash of incoming latent; mismatch = upstream changed
 #   }
 _STATE: dict[str, dict] = {}
+
+# Per-node lock: prevents concurrent runs on the same node from corrupting
+# the shared history stack or fingerprint. ComfyUI is typically serial, but
+# rapid re-queues can overlap. Uses RLock so the same thread can re-enter
+# (e.g. if ComfyUI ever calls run() from within a node callback).
+_STATE_LOCK = threading.RLock()
+
+# Per-node lock registry — protected by _STATE_LOCK itself.
+_NODE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _node_lock(node_id: str) -> threading.Lock:
+    """Return (creating if needed) a per-node Lock for state mutations."""
+    with _STATE_LOCK:
+        if node_id not in _NODE_LOCKS:
+            _NODE_LOCKS[node_id] = threading.Lock()
+        return _NODE_LOCKS[node_id]
+
 
 # Max number of latents to keep in the undo stack per node. Each FLUX 2
 # latent at 832x1776 is ~180 KB (bf16); 10 = ~1.8 MB per node. Cheap.
@@ -103,10 +127,19 @@ def _latent_fingerprint(latent: torch.Tensor) -> str:
     latent (e.g. user changed the prompt + re-queued), so we can
     automatically reset the cache instead of layering refinements
     onto a now-irrelevant base.
+
+    Samples are spaced evenly across the *entire* tensor (not just
+    the first N elements) to avoid bias toward the beginning, which
+    could miss changes that only affect the tail of the flattened
+    tensor (e.g. changes in image corners stored in row-major order).
     """
     flat = latent.detach().to(torch.float32).flatten()
     n = min(flat.numel(), 1024)
-    sample = flat[::max(1, flat.numel() // n)][:n]
+    if flat.numel() <= n:
+        sample = flat
+    else:
+        indices = torch.linspace(0, flat.numel() - 1, n, dtype=torch.long, device=flat.device)
+        sample = flat[indices]
     h = hashlib.sha1()
     h.update(str(tuple(latent.shape)).encode())
     h.update(sample.cpu().numpy().tobytes())
@@ -247,11 +280,8 @@ def _polygons_mask_latent(
 ) -> torch.Tensor:
     """Rasterise one or more silhouette polygons (image-pixel coords) into
     a filled [1, H, W] latent-space mask (their union)."""
-    import numpy as np
-    from PIL import Image, ImageDraw
-
-    img = Image.new("L", (latent_w, latent_h), 0)
-    draw = ImageDraw.Draw(img)
+    img = _PILImage.new("L", (latent_w, latent_h), 0)
+    draw = _PILImageDraw.Draw(img)
     for poly in (polygons_pixel or []):
         if not poly or len(poly) < 6:
             continue
@@ -269,14 +299,9 @@ def _raster_mask_latent(latent_h, latent_w, png_b64, device):
     masked) into a [1, H, W] latent-space mask. The Detect Shift/Alt brush
     produces this — a raster handles brushed holes / unions that a polygon
     silhouette can't. Resized straight to the latent grid (no scale args)."""
-    import base64
-    import io
-    import numpy as np
-    from PIL import Image
-
     raw = base64.b64decode(png_b64)
-    img = Image.open(io.BytesIO(raw)).convert("L")
-    img = img.resize((latent_w, latent_h), Image.BILINEAR)
+    img = _PILImage.open(io.BytesIO(raw)).convert("L")
+    img = img.resize((latent_w, latent_h), _PILImage.BILINEAR)
     arr = np.array(img, dtype=np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...].to(device)
 
@@ -463,7 +488,7 @@ def _refine_with_fine_upscaling(
         # target, so scale<=1.0 — roughly >1024px on FLUX 2) degrade to a
         # whole-latent edit with NO crop reference, so the model worked on the
         # whole image instead of the selected rect.
-        print(f"[Angelo fine-upscale] scale=1.0 — using latent-space path (no VAE round-trip)")
+        print(f"[Angelo fine-upscale] scale={scale:.2f} ≤ 1.0 — using latent-space path (no VAE round-trip)")
         noise = comfy.sample.prepare_noise(current, seed, None)
         new_latent = comfy.sample.sample(
             model, noise, steps, cfg, sampler_name, scheduler,
@@ -494,9 +519,11 @@ def _refine_with_fine_upscaling(
         
     H_pix = cached_pixels.shape[1]
     W_pix = cached_pixels.shape[2]
-    # Pixel-per-latent ratio per axis (16 for FLUX 2, 8 for SDXL/SD1.5)
-    px_per_lat_y = max(1, H_pix // current.shape[-2])
-    px_per_lat_x = max(1, W_pix // current.shape[-1])
+    # Pixel-per-latent ratio per axis. Use rounded float division instead of
+    # integer // to get the best approximation for exotic VAEs where the ratio
+    # is not exactly integer (e.g. 15.8 rounds to 16, while // gives 15).
+    px_per_lat_y = max(1, round(H_pix / current.shape[-2]))
+    px_per_lat_x = max(1, round(W_pix / current.shape[-1]))
 
     # Pixel-space bbox derived from the latent-space bbox.
     y0_p = y0 * px_per_lat_y
@@ -592,7 +619,13 @@ def _refine_with_fine_upscaling(
         # `mask`), so the feather is preserved without the sampling artifacts.
         if latent_up.ndim == 5:
             sample_mask = (mask_crop_up >= 0.5).to(mask_crop_up.dtype)
-        latent_up = (1.0 - sample_mask.unsqueeze(0)) * latent_up
+        # Zero the masked region. For 5D temporal latents [B,C,T,H,W] the
+        # mask is [1,H,W] and needs two extra leading dims to broadcast
+        # correctly; for standard 4D latents [B,C,H,W] one unsqueeze suffices.
+        if latent_up.ndim == 5:
+            latent_up = (1.0 - sample_mask.unsqueeze(0).unsqueeze(0)) * latent_up
+        else:
+            latent_up = (1.0 - sample_mask.unsqueeze(0)) * latent_up
 
     # ----- Refine via noise-injection inpaint on the upscaled latent -----
     noise = comfy.sample.prepare_noise(latent_up, seed, None)
@@ -645,7 +678,14 @@ def _refine_with_fine_upscaling(
     # regions stay bit-exact across successive clicks; only the masked
     # area accumulates any VAE-roundtrip cost (and it gets a fresh
     # refine each click anyway, so any drift there is overwritten).
-    alpha_lat = mask.unsqueeze(0)  # [1, 1, H_lat, W_lat]
+    #
+    # For 5D temporal latents [B,C,T,H,W] the mask [1,H,W] needs two
+    # extra leading dims to broadcast correctly; for 4D [B,C,H,W] one
+    # unsqueeze is enough.
+    if encoded_latent.ndim == 5:
+        alpha_lat = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 1, H_lat, W_lat]
+    else:
+        alpha_lat = mask.unsqueeze(0)  # [1, 1, H_lat, W_lat]
     new_latent = encoded_latent * alpha_lat + current * (1.0 - alpha_lat)
     
     return new_latent, new_pixels
@@ -724,9 +764,6 @@ def _encode_loaded_image(vae, ref_json: str, resize_mode: str, target_mp: float)
     rounded to a multiple of 16 so any supported VAE (8x or 16x) is
     happy. Returns the latent samples tensor.
     """
-    import numpy as np
-    from PIL import Image, ImageOps
-
     # Resolve the image reference to a path.
     name, subfolder, type_ = ref_json, "", "input"
     try:
@@ -744,13 +781,17 @@ def _encode_loaded_image(vae, ref_json: str, resize_mode: str, target_mp: float)
     else:
         base_dir = folder_paths.get_input_directory()
     path = os.path.normpath(os.path.join(base_dir, subfolder, name))
-    if not path.startswith(os.path.normpath(base_dir)):
+    # Guard against path-traversal: require path to be equal to or strictly
+    # inside base_dir. str.startswith without the sep suffix would wrongly
+    # pass e.g. "/tmp/comfy_input_evil" when base is "/tmp/comfy_input".
+    safe_base = os.path.normpath(base_dir)
+    if not (path == safe_base or path.startswith(safe_base + os.sep)):
         raise ValueError("Angelo: invalid loaded-image path")
     if not os.path.exists(path):
         raise ValueError(f"Angelo: loaded image not found: {name}")
 
-    img = Image.open(path)
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = _PILImage.open(path)
+    img = _PILImageOps.exif_transpose(img).convert("RGB")
     w, h = img.size
 
     if resize_mode == "mp" and target_mp > 0:
@@ -764,7 +805,7 @@ def _encode_loaded_image(vae, ref_json: str, resize_mode: str, target_mp: float)
     w = max(16, (w // 16) * 16)
     h = max(16, (h // 16) * 16)
     if (w, h) != img.size:
-        img = img.resize((w, h), Image.LANCZOS)
+        img = img.resize((w, h), _PILImage.LANCZOS)
 
     arr = np.array(img).astype(np.float32) / 255.0      # (H, W, 3)
     pixels = torch.from_numpy(arr)[None, ...]            # (1, H, W, 3)
@@ -1150,7 +1191,8 @@ class AngeloRefine:
         unique_id=None,
     ):
         node_id = str(unique_id)
-        state = _STATE.get(node_id)
+        with _STATE_LOCK:
+            state = _STATE.get(node_id)
 
         # ===== Base latent selection =====
         # While an image is LOADED (loaded_image non-empty), it owns the
@@ -1281,18 +1323,22 @@ class AngeloRefine:
             # via the ui message so JS can (a) apply after-gen control
             # next, and (b) restore this value if the user later switches
             # the control to "fixed".
-            _STATE[node_id] = {
-                "history": [(new_latent, None)],
-                "click_seq": click_seq,
-                "undo_seq": undo_seq,
-                "fingerprint": incoming_fp,
-                "sampler_seed_at_run": int(sampler_seed),
-                "loaded_seq": loaded_seq,
-                # Source image (#3/#9): the session base, captured once so the
-                # source_image output survives _HISTORY_CAP eviction of history[0].
-                "source_latent": new_latent,
-                "source_pixels": None,
-            }
+            with _STATE_LOCK:
+                _STATE[node_id] = {
+                    "history": [(new_latent, None)],
+                    "click_seq": click_seq,
+                    "undo_seq": undo_seq,
+                    "redo_seq": redo_seq,
+                    "reroll_seq": reroll_seq,
+                    "redo_stack": [],
+                    "fingerprint": incoming_fp,
+                    "sampler_seed_at_run": int(sampler_seed),
+                    "loaded_seq": loaded_seq,
+                    # Source image (#3/#9): the session base, captured once so the
+                    # source_image output survives _HISTORY_CAP eviction of history[0].
+                    "source_latent": new_latent,
+                    "source_pixels": None,
+                }
             out_latent = {"samples": new_latent}
             ui_msg = {
                 "Angelo_preview": [],
@@ -1325,7 +1371,8 @@ class AngeloRefine:
         # "suddenly reverts to an earlier stage while painting" bug). Those
         # bases only change via explicit Load / Unload / Reset, all handled
         # by `reset` / `new_loaded` above — so the fingerprint isn't needed.
-        state = _STATE.get(node_id)
+        with _STATE_LOCK:
+            state = _STATE.get(node_id)
         fingerprint_changed = (
             base_from_wired_latent
             and state is not None
@@ -1345,17 +1392,21 @@ class AngeloRefine:
             # the new-click gate and replay a stale inpaint onto the new
             # base. The user's next genuine click bumps click_seq and fires
             # normally.
-            _STATE[node_id] = {
-                "history": [(incoming.clone(), None)],
-                "click_seq": click_seq,
-                "undo_seq": undo_seq,
-                "fingerprint": incoming_fp,
-                "loaded_seq": loaded_seq,
-                # Source image (#3/#9): capture the base once, independent of
-                # history[0] (which mutates under _HISTORY_CAP eviction).
-                "source_latent": incoming.clone(),
-                "source_pixels": None,
-            }
+            with _STATE_LOCK:
+                _STATE[node_id] = {
+                    "history": [(incoming.clone(), None)],
+                    "click_seq": click_seq,
+                    "undo_seq": undo_seq,
+                    "redo_seq": redo_seq,
+                    "reroll_seq": reroll_seq,
+                    "redo_stack": [],
+                    "fingerprint": incoming_fp,
+                    "loaded_seq": loaded_seq,
+                    # Source image (#3/#9): capture the base once, independent of
+                    # history[0] (which mutates under _HISTORY_CAP eviction).
+                    "source_latent": incoming.clone(),
+                    "source_pixels": None,
+                }
             state = _STATE[node_id]
 
         # Undo: if undo_seq advanced and we have history to pop, pop it.
@@ -1463,8 +1514,13 @@ class AngeloRefine:
                 print("[Angelo] warning: image_w/h not set by JS; "
                       "falling back to 8x VAE assumption — may be wrong for FLUX 2")
 
-            r_latent = max(1.0, click_radius * scale_x)
-            sigma_latent = (feather_radius * scale_x) if feather_radius > 0 else 0.0
+            # Use the geometric mean of both axes for isotropic radius/feather
+            # in latent space. For square images scale_x == scale_y so there is
+            # no change; for portrait/landscape the geometric mean gives the
+            # closest-area approximation and keeps the circle visually round.
+            scale_geom = math.sqrt(scale_x * scale_y)
+            r_latent = max(1.0, click_radius * scale_geom)
+            sigma_latent = (feather_radius * scale_geom) if feather_radius > 0 else 0.0
 
             # Build the mask. Sources of mask shape, in priority:
             #   1. Smart Guided Inpaint: full-image (no region — the whole

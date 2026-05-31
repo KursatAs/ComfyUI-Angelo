@@ -225,7 +225,12 @@ def detect_text(pil_image, text, confidence_threshold=0.3, max_detections=20):
         boxes = state.get("boxes", None)
         scores = state.get("scores", None)
         if masks is None or len(masks) == 0:
-            return []
+            # No detections — return the standard result envelope with an
+            # empty detections list. Returning [] (a bare list) here caused
+            # the HTTP handler's `{"ok": True, **result}` spread to raise
+            # TypeError: 'list' is not a mapping, turning a zero-result run
+            # into an HTTP 500 instead of a clean empty response.
+            return {"width": img_w, "height": img_h, "detections": []}
 
         # Sort by score (desc) and cap.
         if scores is not None and len(scores) > 0:
@@ -276,7 +281,7 @@ except ImportError:
 def _load_preview_image(filename, subfolder, type_):
     """Resolve a ComfyUI /view-style image ref to a PIL image."""
     import folder_paths
-    from PIL import Image
+    from PIL import Image as _PILImageLocal
     type_ = type_ or "temp"
     if type_ == "output":
         base = folder_paths.get_output_directory()
@@ -287,9 +292,12 @@ def _load_preview_image(filename, subfolder, type_):
     path = os.path.join(base, subfolder or "", filename or "")
     path = os.path.normpath(path)
     # Guard against path traversal outside the base dir.
-    if not os.path.normpath(path).startswith(os.path.normpath(base)):
+    # str.startswith without a trailing separator suffix would wrongly pass
+    # paths like "/tmp/comfy_temp_evil" when base is "/tmp/comfy_temp".
+    safe_base = os.path.normpath(base)
+    if not (path == safe_base or path.startswith(safe_base + os.sep)):
         raise ValueError("invalid image path")
-    return Image.open(path).convert("RGB")
+    return _PILImageLocal.open(path).convert("RGB")
 
 
 if _HAS_SERVER:
@@ -322,7 +330,9 @@ if _HAS_SERVER:
 
         # Run the (blocking, GPU) detection off the event loop.
         import asyncio
-        loop = asyncio.get_event_loop()
+        # asyncio.get_event_loop() is deprecated in Python 3.10+ when called
+        # from within a running async context. Use get_running_loop() instead.
+        loop = asyncio.get_running_loop()
         try:
             if method == "sam3_text":
                 result = await loop.run_in_executor(

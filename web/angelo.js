@@ -2010,6 +2010,9 @@ function loadIntoCanvas(node, url) {
     };
     img.onerror = (e) => {
         dbg("image load error", e, url);
+        // Show a visible notice so the user knows the preview failed to load,
+        // rather than leaving the canvas blank or stale with no feedback.
+        showAngeloNotice(node, "Preview failed to load. Try re-queuing the workflow.");
     };
     img.src = url;
 }
@@ -2475,16 +2478,56 @@ function syncDetectModeButton(node) {
     panel.style.display = (node._AngeloDetections && node._AngeloDetections.length) ? "flex" : "none";
 }
 
-// Topmost (tightest) detection whose bbox contains the image-pixel point.
+// Ray-casting point-in-polygon test. flat = [x0,y0,x1,y1,...] polygon
+// coords in image-pixel space. Returns true if (px, py) is inside.
+function _pointInPolygon(px, py, flat) {
+    const n = flat.length >> 1;
+    if (n < 3) return false;
+    let inside = false;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = flat[2 * i], yi = flat[2 * i + 1];
+        const xj = flat[2 * j], yj = flat[2 * j + 1];
+        if (((yi > py) !== (yj > py)) &&
+            (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// Topmost (tightest) detection whose silhouette contains the image-pixel point.
+// Falls back to bbox containment when the detection has no polygons (e.g. a
+// grown/edited raster mask where the original polygon may be stale). Selects
+// the candidate with the smallest bbox area among those that contain the point
+// so overlapping detections resolve to the tightest fit.
 function _detAtPoint(node, px, py) {
     const dets = node._AngeloDetections || [];
     let best = null, bestArea = Infinity;
     for (const d of dets) {
         const b = _detBbox(node, d);
         if (!b) continue;
-        if (px >= b[0] && px <= b[2] && py >= b[1] && py <= b[3]) {
-            const area = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]));
+        // Quick bbox pre-filter — skip if the point is outside the bbox.
+        if (px < b[0] || px > b[2] || py < b[1] || py > b[3]) continue;
+        const area = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]));
+        // If the detection has an edit-mask, bbox containment is the best we
+        // can do (raster masks have no polygon representation).
+        if (d._editMask) {
             if (area < bestArea) { bestArea = area; best = d; }
+            continue;
+        }
+        // Polygon hit-test: accept if the point lands inside ANY of the
+        // detection's polygons (detections can be multi-part, e.g. two eyes).
+        const polys = _detPolys(node, d);
+        if (polys.length === 0) {
+            // No polygons at all — fall back to bbox.
+            if (area < bestArea) { bestArea = area; best = d; }
+        } else {
+            for (const poly of polys) {
+                if (poly && _pointInPolygon(px, py, poly)) {
+                    if (area < bestArea) { bestArea = area; best = d; }
+                    break;
+                }
+            }
         }
     }
     return best;
@@ -2707,19 +2750,21 @@ function _pickTouchupTarget(node, px, py) {
     return best;
 }
 
-// Reusable scratch canvas for tinting a raster edit-mask in a candidate's
-// colour before compositing it onto the overlay.
-let _angeloScratch = null;
-function _getScratch(w, h) {
-    if (!_angeloScratch) _angeloScratch = document.createElement("canvas");
-    if (_angeloScratch.width !== w) _angeloScratch.width = w;
-    if (_angeloScratch.height !== h) _angeloScratch.height = h;
-    return _angeloScratch;
+// Per-node scratch canvas for tinting a raster edit-mask in a candidate's
+// colour before compositing it onto the overlay. Using a per-node canvas
+// (stored on node._AngeloScratch) avoids shared-state corruption if two
+// nodes ever redraw in overlapping animation frames.
+function _getScratch(node, w, h) {
+    if (!node._AngeloScratch) node._AngeloScratch = document.createElement("canvas");
+    const s = node._AngeloScratch;
+    if (s.width !== w) s.width = w;
+    if (s.height !== h) s.height = h;
+    return s;
 }
-function _drawTintedMask(ctx, det, color, fillAlpha) {
+function _drawTintedMask(ctx, det, color, fillAlpha, node) {
     const m = det._editMask;
     const W = m.width, H = m.height;
-    const s = _getScratch(W, H);
+    const s = _getScratch(node, W, H);
     const sx = s.getContext("2d");
     sx.clearRect(0, 0, W, H);
     sx.globalCompositeOperation = "source-over";
@@ -2773,10 +2818,10 @@ function drawDetections(node, ctx) {
                 ctx.save();
                 ctx.shadowColor = tint;
                 ctx.shadowBlur = 16;
-                _drawTintedMask(ctx, d, tint, 0.55);
+                _drawTintedMask(ctx, d, tint, 0.55, node);
                 ctx.restore();
             } else {
-                _drawTintedMask(ctx, d, tint, 0.30);
+                _drawTintedMask(ctx, d, tint, 0.30, node);
             }
         } else if (smart) {
             const b = _detBbox(node, d);
@@ -3065,10 +3110,13 @@ function triggerReset(node) {
     const wx = findWidget(node, "click_x");
     const wy = findWidget(node, "click_y");
     if (!wr) return;
-    wr.value = true;
-    if (wx) wx.value = -1;
-    if (wy) wy.value = -1;
-    if (ws) ws.value = ((ws.value || 0) + 1) & 0x7FFFFFFF;
+    // Use setWidget() for all mutations so the widget callback fires and
+    // serialisation stays consistent — direct .value assignment would
+    // bypass the callback in some ComfyUI versions.
+    setWidget(wr, true);
+    if (wx) setWidget(wx, -1);
+    if (wy) setWidget(wy, -1);
+    if (ws) setWidget(ws, ((ws.value || 0) + 1) & 0x7FFFFFFF);
     node._AngeloImg = null;
     if (node._AngeloCanvas) {
         const ctx = node._AngeloCanvas.getContext("2d");
@@ -3079,7 +3127,7 @@ function triggerReset(node) {
     if (typeof app.queuePrompt === "function") app.queuePrompt(0);
     setTimeout(() => {
         if (wr.value === true) {
-            wr.value = false;
+            setWidget(wr, false);
             app.graph.setDirtyCanvas(true, true);
         }
     }, 1000);
@@ -3390,23 +3438,29 @@ function syncModeSwitchToFixed(node, prevMode) {
  * ours are explicit ENUM widgets so we do the modification ourselves.
  * Runs AFTER the response is processed so seed_at_run capture happens
  * first (lock-on-fixed restores from the pre-modification value).
+ *
+ * NOTE: JavaScript's float64 can only represent integers exactly up to
+ * Number.MAX_SAFE_INTEGER (2^53 − 1 ≈ 9×10^15). The Python widget max is
+ * 0xFFFFFFFFFFFFFFFF (uint64), which is beyond float64 precision. We cap
+ * all arithmetic at Number.MAX_SAFE_INTEGER so increment/decrement/randomize
+ * never produce a value that can't be represented exactly.
  */
 function applyAfterGenControl(node, seedWidgetName, controlWidgetName) {
     const seedW = findWidget(node, seedWidgetName);
     const ctrlW = findWidget(node, controlWidgetName);
     if (!seedW || !ctrlW) return;
     const ctrl = String(ctrlW.value);
-    const maxSeed = 0xFFFFFFFFFFFFFFFF;
+    const maxSeed = Number.MAX_SAFE_INTEGER;  // 2^53−1; safe float64 integer range
     let cur = Number(seedW.value || 0);
     let next = cur;
     switch (ctrl) {
         case "fixed":     return;  // no change
-        case "increment": next = (cur + 1) % (maxSeed + 1); break;
+        case "increment": next = cur >= maxSeed ? 0 : cur + 1; break;
         case "decrement": next = cur > 0 ? cur - 1 : maxSeed; break;
         case "randomize":
             // 53 bits is the safe integer range; that's plenty of seed
             // entropy for any sampler.
-            next = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+            next = Math.floor(Math.random() * maxSeed);
             break;
         default: return;
     }
@@ -3622,13 +3676,19 @@ function makeNumberInput(label, opts, onChange) {
     input.style.borderRadius = "3px";
     input.style.background = "#1a1a1a";
     input.style.color = "#ddd";
-    input.addEventListener("change", () => {
+    function _commitNumberInput() {
         let v = parseFloat(input.value);
         if (!isFinite(v)) v = opts.min ?? 0;
         const lo = opts.min ?? -Infinity, hi = opts.max ?? Infinity;
         v = Math.max(lo, Math.min(hi, v));
         input.value = String(v);
         onChange(v);
+    }
+    // Fire on blur (user tabs away) OR on Enter key so changes aren't lost
+    // when the user types a value and presses Enter without leaving the field.
+    input.addEventListener("change", _commitNumberInput);
+    input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); _commitNumberInput(); }
     });
     // Stop click on the input from selecting / dragging the node behind it.
     input.addEventListener("mousedown", (e) => e.stopPropagation());
