@@ -178,15 +178,15 @@ function installKeyboardShortcuts() {
 
         if (event.clipboardData && event.clipboardData.files && event.clipboardData.files.length > 0) {
             const imageFiles = Array.from(event.clipboardData.files).filter(f => f.type.startsWith("image/"));
-            
+
             if (imageFiles.length > 0) {
                 // Strictly prevent ComfyUI from intercepting this and spawning a LoadImage node
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation();
-                
+
                 let file = imageFiles[0];
-                
+
                 // Browsers often name pasted files generically like "image.png".
                 // Append a timestamp to make it distinct in uploads and logs.
                 if (file.name === "image.png" || !file.name) {
@@ -194,13 +194,13 @@ function installKeyboardShortcuts() {
                     const fakeName = `pasted_${Date.now()}.${ext}`;
                     file = new File([file], fakeName, { type: file.type });
                 }
-                
+
                 // Route it through the same resolution popup as Drag & Drop / Load Image.
                 showLoadImagePopup(node, file);
             }
         }
     }, true);  // capture phase on window guarantees it fires before ComfyUI's document listener
-    
+
     dbg("installed keyboard shortcuts");
 }
 
@@ -839,56 +839,10 @@ function attachPreviewCanvas(node) {
     node._AngeloDetectPanel = detectPanel;
     node._AngeloDetOpacitySlider = opSlider;
 
-    // ===== ROW 3: shared generation config (always active) =====
-    const stepsInput = makeNumberInput("Steps", { min: 1, max: 100, step: 1, width: 48 }, (val) => {
-        const w = findWidget(node, "steps");
-        if (!w) return;
-        setWidget(w, Math.round(val));
-    });
-    stepsInput.title = "Sampler step count for both Sampler Mode and refines. Match the model — FLUX 2 Klein distilled = 4.";
-    row3.appendChild(stepsInput);
-    node._AngeloStepsInput = stepsInput;
-
-    const cfgInput = makeNumberInput("CFG", { min: 0.0, max: 30.0, step: 0.1, width: 48 }, (val) => {
-        const w = findWidget(node, "cfg");
-        if (!w) return;
-        setWidget(w, val);
-    });
-    cfgInput.title = "Classifier-free guidance scale. FLUX 2 Klein distilled uses CFG=1 (no negative branch).";
-    row3.appendChild(cfgInput);
-    node._AngeloCfgInput = cfgInput;
-
-    const samplerWidget = findWidget(node, "sampler_name");
-    const samplerOptions = (samplerWidget && samplerWidget.options && samplerWidget.options.values)
-        ? samplerWidget.options.values
-        : ["euler"];
-    const samplerSelect = makeDropdown("Sampler",
-        samplerOptions,
-        (val) => {
-            const w = findWidget(node, "sampler_name");
-            if (!w) return;
-            setWidget(w, val);
-        }
-    );
-    samplerSelect.title = "Sampling algorithm (shared by Sampler Mode + refines).";
-    row3.appendChild(samplerSelect);
-    node._AngeloSamplerSelect = samplerSelect;
-
-    const schedulerWidget = findWidget(node, "scheduler");
-    const schedulerOptions = (schedulerWidget && schedulerWidget.options && schedulerWidget.options.values)
-        ? schedulerWidget.options.values
-        : ["simple"];
-    const schedulerSelect = makeDropdown("Sched",
-        schedulerOptions,
-        (val) => {
-            const w = findWidget(node, "scheduler");
-            if (!w) return;
-            setWidget(w, val);
-        }
-    );
-    schedulerSelect.title = "Noise schedule (shared by Sampler Mode + refines).";
-    row3.appendChild(schedulerSelect);
-    node._AngeloSchedulerSelect = schedulerSelect;
+    // ===== ROW 3: Load Image (always active) =====
+    // Steps widget removed — step count is determined entirely by the
+    // connected Flux2Scheduler (len(sigmas)-1 for Sampler Mode,
+    // round((len(sigmas)-1) × denoise) for Edit Mode).
 
     // Load Image — bring an external photo in as the base to edit. Always
     // active (both modes); no Empty Latent needed.
@@ -931,14 +885,6 @@ function attachPreviewCanvas(node) {
     row4.appendChild(samplerSeedCtrlSelect);
     node._AngeloSamplerSeedCtrlSelect = samplerSeedCtrlSelect;
 
-    const samplerDenoiseInput = makeNumberInput("Smpl Denoise", { min: 0.0, max: 1.0, step: 0.05, width: 56 }, (val) => {
-        const w = findWidget(node, "sampler_denoise");
-        if (!w) return;
-        setWidget(w, val);
-    });
-    samplerDenoiseInput.title = "[Sampler Mode] Denoise for the base generation. 1.0 = full generation from the incoming (usually empty) latent.";
-    row4.appendChild(samplerDenoiseInput);
-    node._AngeloSamplerDenoiseInput = samplerDenoiseInput;
 
     container.appendChild(toggleBarWrap);
 
@@ -3592,16 +3538,7 @@ function syncModeSelect(node) {
     _syncDropdownWrap(node._AngeloModeSelect, findWidget(node, "mode")?.value);
 }
 function syncStepsInput(node) {
-    _syncNumberInput(node._AngeloStepsInput, findWidget(node, "steps")?.value);
-}
-function syncCfgInput(node) {
-    _syncNumberInput(node._AngeloCfgInput, findWidget(node, "cfg")?.value);
-}
-function syncSamplerSelect(node) {
-    _syncDropdownWrap(node._AngeloSamplerSelect, findWidget(node, "sampler_name")?.value);
-}
-function syncSchedulerSelect(node) {
-    _syncDropdownWrap(node._AngeloSchedulerSelect, findWidget(node, "scheduler")?.value);
+    // steps widget removed — no-op kept so any external callers don't throw.
 }
 function syncSamplerSeedInput(node) {
     _syncNumberInput(node._AngeloSamplerSeedInput, findWidget(node, "sampler_seed")?.value);
@@ -3610,7 +3547,9 @@ function syncSamplerSeedCtrlSelect(node) {
     _syncDropdownWrap(node._AngeloSamplerSeedCtrlSelect, findWidget(node, "sampler_seed_control")?.value);
 }
 function syncSamplerDenoiseInput(node) {
-    _syncNumberInput(node._AngeloSamplerDenoiseInput, findWidget(node, "sampler_denoise")?.value);
+    // sampler_denoise widget removed — sampler-mode denoise is now encoded in the
+    // connected SIGMAS (BasicScheduler denoise param). No-op kept for compatibility
+    // with any external code that might call this.
 }
 function syncGuidedLocationSelect(node) {
     _syncDropdownWrap(node._AngeloGuidedLocationSelect, findWidget(node, "guided_location")?.value);
@@ -3653,9 +3592,6 @@ function syncAllToolbarControls(node) {
     // Row 3/4 sampler + generation controls.
     syncModeSelect(node);
     syncStepsInput(node);
-    syncCfgInput(node);
-    syncSamplerSelect(node);
-    syncSchedulerSelect(node);
     syncSamplerSeedInput(node);
     syncSamplerSeedCtrlSelect(node);
     syncSamplerDenoiseInput(node);
@@ -3799,8 +3735,7 @@ function hideMechanicalWidgets(node) {
         "min_megapixels", "max_upscale", "resize_method", "fine_context_pad",
         "inpainting_mode",
         // Sampler / generation config — now in toolbar rows 3 & 4
-        "mode", "sampler_denoise", "sampler_seed", "sampler_seed_control",
-        "steps", "cfg", "sampler_name", "scheduler",
+        "mode", "sampler_seed", "sampler_seed_control",
         // Deprecated control — always-on, kept declared for serialization
         "auto_decode",
         // Driven by the Reset button on the toolbar — no need to see the widget too

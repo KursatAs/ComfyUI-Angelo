@@ -24,6 +24,7 @@ The cache is in-process state only — restart of ComfyUI clears it.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -44,7 +45,6 @@ import node_helpers
 
 # Reuse PreviewImage's save machinery for the preview output.
 import nodes as comfy_nodes
-
 
 # Per-node state cache:
 #   unique_id -> {
@@ -77,6 +77,65 @@ def _node_lock(node_id: str) -> threading.Lock:
         return _NODE_LOCKS[node_id]
 
 
+def _guider_sample(
+        temp_g,
+        noise: torch.Tensor,
+        latent: torch.Tensor,
+        sampler,
+        sigmas: torch.Tensor,
+        *,
+        denoise_mask: torch.Tensor | None = None,
+        callback=None,
+        disable_pbar: bool = False,
+        seed: int | None = None,
+) -> torch.Tensor:
+    """ Kursat note!!!
+    Device-safe wrapper around guider.sample().
+
+    ComfyUI's built-in ``CFGGuider.sample()`` moves noise, latent, and
+    denoise_mask to the model's load device before sampling.  Some
+    third-party extensions (e.g. ComfyUI-NAG-Extended) override
+    ``inner_sample`` without repeating that movement, so CPU tensors
+    survive into the k-sampler's inpaint path where they collide with GPU
+    tensors and raise a device-mismatch RuntimeError.
+
+    Moving everything to ``load_device`` here is a safe no-op when the
+    built-in already does it, and fixes the crash for extensions that don't.
+    """
+    device = temp_g.model_patcher.load_device
+    noise = noise.to(device)
+    latent = latent.to(device)
+    if denoise_mask is not None:
+        denoise_mask = denoise_mask.to(device)
+    return temp_g.sample(
+        noise, latent, sampler, sigmas,
+        denoise_mask=denoise_mask,
+        callback=callback,
+        disable_pbar=disable_pbar,
+        seed=seed,
+    )
+
+
+def _guider_with_conds(guider, positive, negative):
+    g = copy.copy(guider)
+    try:
+        g.set_conds(positive, negative)  # comfy.samplers.CFGGuider
+    except TypeError:
+        g.set_conds(positive)  # comfy.samplers.BaseGuider / BasicGuider
+    return g
+
+
+def _truncate_sigmas_for_denoise(sigmas: torch.Tensor, denoise: float) -> torch.Tensor:
+    if denoise >= 1.0:
+        return sigmas
+    if denoise <= 0.0:
+        # Return just the terminal sigma so the sampler does nothing.
+        return sigmas[-1:].new_zeros(2)
+    n_total = len(sigmas) - 1  # number of timesteps in the schedule
+    n_refine = max(1, round(n_total * denoise))
+    return sigmas[-(n_refine + 1):]
+
+
 # Max number of latents to keep in the undo stack per node. Each FLUX 2
 # latent at 832x1776 is ~180 KB (bf16); 10 = ~1.8 MB per node. Cheap.
 _HISTORY_CAP: int = 10
@@ -96,27 +155,27 @@ _FINE_UPSCALE_RESIZE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", 
 # Order is preserved (py3.7+ dicts) so the JS can build its dropdown
 # from the same list via the widget's tooltip / a mirrored array.
 _GUIDED_LOCATION_PREFIXES = {
-    "(none)":               "",
-    "Whole image":          "Across the whole image, ",
-    "Top left":             "In the top left of the image, ",
-    "Top middle":           "In the top middle of the image, ",
-    "Top right":            "In the top right of the image, ",
-    "Middle left":          "On the left middle of the image, ",
-    "Center":               "In the center of the image, ",
-    "Middle right":         "On the right middle of the image, ",
-    "Bottom left":          "In the bottom left of the image, ",
-    "Bottom middle":        "In the bottom middle of the image, ",
-    "Bottom right":         "In the bottom right of the image, ",
-    "Left edge":            "Along the left edge of the image, ",
-    "Right edge":           "Along the right edge of the image, ",
-    "Top edge":             "Along the top edge of the image, ",
-    "Bottom edge":          "Along the bottom edge of the image, ",
-    "Top half":             "In the top half of the image, ",
-    "Bottom half":          "In the bottom half of the image, ",
-    "Left half":            "In the left half of the image, ",
-    "Right half":           "In the right half of the image, ",
-    "Top of the image":     "At the top of the image, ",
-    "Bottom of the image":  "At the bottom of the image, ",
+    "(none)": "",
+    "Whole image": "Across the whole image, ",
+    "Top left": "In the top left of the image, ",
+    "Top middle": "In the top middle of the image, ",
+    "Top right": "In the top right of the image, ",
+    "Middle left": "On the left middle of the image, ",
+    "Center": "In the center of the image, ",
+    "Middle right": "On the right middle of the image, ",
+    "Bottom left": "In the bottom left of the image, ",
+    "Bottom middle": "In the bottom middle of the image, ",
+    "Bottom right": "In the bottom right of the image, ",
+    "Left edge": "Along the left edge of the image, ",
+    "Right edge": "Along the right edge of the image, ",
+    "Top edge": "Along the top edge of the image, ",
+    "Bottom edge": "Along the bottom edge of the image, ",
+    "Top half": "In the top half of the image, ",
+    "Bottom half": "In the bottom half of the image, ",
+    "Left half": "In the left half of the image, ",
+    "Right half": "In the right half of the image, ",
+    "Top of the image": "At the top of the image, ",
+    "Bottom of the image": "At the bottom of the image, ",
 }
 
 
@@ -168,13 +227,13 @@ def _parse_stroke_points(raw: str) -> list[tuple[float, float]]:
 
 
 def _stroke_mask_latent(
-    latent_h: int,
-    latent_w: int,
-    stroke_points_pixel: list[tuple[float, float]],
-    r_latent: float,
-    scale_x: float,
-    scale_y: float,
-    device: torch.device,
+        latent_h: int,
+        latent_w: int,
+        stroke_points_pixel: list[tuple[float, float]],
+        r_latent: float,
+        scale_x: float,
+        scale_y: float,
+        device: torch.device,
 ) -> torch.Tensor:
     """Vectorised union of circles in latent space, one circle per
     point in stroke_points_pixel. Points come in image-pixel coords;
@@ -227,12 +286,12 @@ def _parse_rect_points(raw: str) -> tuple[float, float, float, float] | None:
 
 
 def _rect_mask_latent(
-    latent_h: int,
-    latent_w: int,
-    rect_pixel: tuple[float, float, float, float],
-    scale_x: float,
-    scale_y: float,
-    device: torch.device,
+        latent_h: int,
+        latent_w: int,
+        rect_pixel: tuple[float, float, float, float],
+        scale_x: float,
+        scale_y: float,
+        device: torch.device,
 ) -> torch.Tensor:
     """Build a [1, H, W] filled-rectangle mask in latent space.
 
@@ -271,12 +330,12 @@ def _parse_seg_polygons(raw: str):
 
 
 def _polygons_mask_latent(
-    latent_h: int,
-    latent_w: int,
-    polygons_pixel,
-    scale_x: float,
-    scale_y: float,
-    device: torch.device,
+        latent_h: int,
+        latent_w: int,
+        polygons_pixel,
+        scale_x: float,
+        scale_y: float,
+        device: torch.device,
 ) -> torch.Tensor:
     """Rasterise one or more silhouette polygons (image-pixel coords) into
     a filled [1, H, W] latent-space mask (their union)."""
@@ -330,12 +389,12 @@ def _mask_bbox_latent(mask: torch.Tensor) -> tuple[int, int, int, int] | None:
 
 
 def _fine_upscale_factor(
-    bbox_w_latent: int,
-    bbox_h_latent: int,
-    scale_x: float,
-    scale_y: float,
-    target_mp: float,
-    max_linear: float,
+        bbox_w_latent: int,
+        bbox_h_latent: int,
+        scale_x: float,
+        scale_y: float,
+        target_mp: float,
+        max_linear: float,
 ) -> float:
     """Linear scale factor to apply to the cropped latent so that the
     crop is processed at ≥ target_mp (in image-pixel-equivalent terms),
@@ -414,29 +473,28 @@ def _vae_encode(vae, pixels: torch.Tensor) -> torch.Tensor:
 
 
 def _refine_with_fine_upscaling(
-    *,
-    model,
-    vae,
-    current: torch.Tensor,               # [B, C, H_lat, W_lat] cached full-res latent
-    current_pixels: torch.Tensor | None, # [B, H_pix, W_pix, C] cached full-res pixels to avoid redundant VAE decode
-    mask: torch.Tensor,                  # [1, H_lat, W_lat] feathered mask, latent res
-    scale_x: float,
-    scale_y: float,
-    target_mp: float,
-    max_linear: float,
-    resize_method: str,
-    context_pad_pixel: int,
-    inpainting_mode: str,
-    seed: int,
-    steps: int,
-    cfg: float,
-    sampler_name: str,
-    scheduler: str,
-    positive,
-    negative,
-    denoise: float,
-    callback,
-    disable_pbar: bool,
+        *,
+        guider,
+        sampler,
+        sigmas: torch.Tensor,
+        vae,
+        current: torch.Tensor,  # [B, C, H_lat, W_lat] cached full-res latent
+        current_pixels: torch.Tensor | None,
+        # [B, H_pix, W_pix, C] cached full-res pixels to avoid redundant VAE decode
+        mask: torch.Tensor,  # [1, H_lat, W_lat] feathered mask, latent res
+        scale_x: float,
+        scale_y: float,
+        target_mp: float,
+        max_linear: float,
+        resize_method: str,
+        context_pad_pixel: int,
+        inpainting_mode: str,
+        seed: int,
+        positive,
+        negative,
+        denoise: float,
+        callback,
+        disable_pbar: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Pixel-space crop + upscale + VAE encode + refine + VAE decode +
     downscale + composite + VAE encode. The latent-space crop+upscale
@@ -490,15 +548,16 @@ def _refine_with_fine_upscaling(
         # whole image instead of the selected rect.
         print(f"[Angelo fine-upscale] scale={scale:.2f} ≤ 1.0 — using latent-space path (no VAE round-trip)")
         noise = comfy.sample.prepare_noise(current, seed, None)
-        new_latent = comfy.sample.sample(
-            model, noise, steps, cfg, sampler_name, scheduler,
-            positive, negative, current,
-            denoise=denoise,
-            noise_mask=mask,
+        refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
+        temp_g = _guider_with_conds(guider, positive, negative)
+        new_latent = _guider_sample(
+            temp_g, noise, current, sampler, refine_sigmas,
+            denoise_mask=mask,
             callback=callback,
             disable_pbar=disable_pbar,
             seed=seed,
         )
+        new_latent = new_latent.to(comfy.model_management.intermediate_device())
         # Return None for pixels because the latent was modified directly;
         # this forces a fresh VAE decode for the preview in the main run() method.
         return new_latent, None
@@ -510,13 +569,13 @@ def _refine_with_fine_upscaling(
         scale = max(1.0, scale)
 
     # ----- VAE decode the full cached latent → cached pixels -----
-    # Optimization: Reuse cached pixels if available to prevent VAE degradation 
+    # Optimization: Reuse cached pixels if available to prevent VAE degradation
     # (loss of high-frequency details) across multiple consecutive edits.
     if current_pixels is not None:
         cached_pixels = current_pixels
     else:
         cached_pixels = _vae_decode(vae, current)  # (B, H_pix, W_pix, C) float [0,1]
-        
+
     H_pix = cached_pixels.shape[1]
     W_pix = cached_pixels.shape[2]
     # Pixel-per-latent ratio per axis. Use rounded float division instead of
@@ -629,15 +688,16 @@ def _refine_with_fine_upscaling(
 
     # ----- Refine via noise-injection inpaint on the upscaled latent -----
     noise = comfy.sample.prepare_noise(latent_up, seed, None)
-    refined_latent_up = comfy.sample.sample(
-        model, noise, steps, cfg, sampler_name, scheduler,
-        positive, negative, latent_up,
-        denoise=denoise,
-        noise_mask=sample_mask,
+    refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
+    temp_g = _guider_with_conds(guider, positive, negative)
+    refined_latent_up = _guider_sample(
+        temp_g, noise, latent_up, sampler, refine_sigmas,
+        denoise_mask=sample_mask,
         callback=callback,
         disable_pbar=disable_pbar,
         seed=seed,
     )
+    refined_latent_up = refined_latent_up.to(comfy.model_management.intermediate_device())
 
     # ----- VAE decode refined latent → high-res pixel patch -----
     refined_pixel_up = _vae_decode(vae, refined_latent_up)  # (B, target_h_p, target_w_p, C)
@@ -687,17 +747,17 @@ def _refine_with_fine_upscaling(
     else:
         alpha_lat = mask.unsqueeze(0)  # [1, 1, H_lat, W_lat]
     new_latent = encoded_latent * alpha_lat + current * (1.0 - alpha_lat)
-    
+
     return new_latent, new_pixels
 
 
 def _circle_mask_latent_direct(
-    latent_h: int,
-    latent_w: int,
-    cx_latent: float,
-    cy_latent: float,
-    r_latent: float,
-    device: torch.device,
+        latent_h: int,
+        latent_w: int,
+        cx_latent: float,
+        cy_latent: float,
+        r_latent: float,
+        device: torch.device,
 ) -> torch.Tensor:
     """Build a binary [1, latent_h, latent_w] mask with a filled circle
     centred on (cx_latent, cy_latent) of radius `r_latent`, all in
@@ -807,8 +867,8 @@ def _encode_loaded_image(vae, ref_json: str, resize_mode: str, target_mp: float)
     if (w, h) != img.size:
         img = img.resize((w, h), _PILImage.LANCZOS)
 
-    arr = np.array(img).astype(np.float32) / 255.0      # (H, W, 3)
-    pixels = torch.from_numpy(arr)[None, ...]            # (1, H, W, 3)
+    arr = np.array(img).astype(np.float32) / 255.0  # (H, W, 3)
+    pixels = torch.from_numpy(arr)[None, ...]  # (1, H, W, 3)
     samples = _vae_encode(vae, pixels[:, :, :, :3])
     return samples
 
@@ -835,7 +895,13 @@ class AngeloRefine:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL",),
+                #   Kursat Note!!!
+                #   BasicScheduler          → sigmas   (use denoise=1.0 here;
+                #                             Angelo truncates internally for
+                #                             the per-click refine denoise)
+                "guider": ("GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "vae": ("VAE",),
@@ -844,25 +910,21 @@ class AngeloRefine:
                 # Visible in the node body. When `mode == "Sampler Mode"`, the
                 # toolbar is greyed and canvas clicks do nothing — this widget
                 # group is the active one, producing the base latent from the
-                # incoming latent via comfy.sample.sample. When mode flips to
-                # Refinement, sampler_seed_control is auto-forced to "fixed"
-                # so subsequent Queue presses don't regenerate the base.
+                # incoming latent using guider + sampler + sigmas above. When
+                # mode flips to Edit Mode, sampler_seed_control is auto-forced
+                # to "fixed" so subsequent Queue presses don't regenerate the
+                # base.
                 "mode": (["Sampler Mode", "Edit Mode"], {"default": "Sampler Mode",
-                                                                "tooltip": "Sampler Mode: AngeloRefine acts "
-                                                                           "like a KSampler — generates the "
-                                                                           "base latent from the incoming "
-                                                                           "(usually empty) latent. Toolbar "
-                                                                           "and canvas clicks are inert. "
-                                                                           "Edit Mode: click / paint / drag "
-                                                                           "to refine or inpaint the cached "
-                                                                           "base. Switching to Edit Mode auto-"
-                                                                           "locks sampler_seed_control to "
-                                                                           "'fixed' so the base stays stable."}),
-                "sampler_denoise": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 1.0, "step": 0.05,
-                                              "tooltip": "[Sampler Mode] Denoise level for the base "
-                                                         "generation. 1.0 = generate fully from noise "
-                                                         "(KSampler default). Lower = img2img-style from "
-                                                         "the incoming latent."}),
+                                                         "tooltip": "Sampler Mode: AngeloRefine acts "
+                                                                    "like a KSampler — generates the "
+                                                                    "base latent from the incoming "
+                                                                    "(usually empty) latent. Toolbar "
+                                                                    "and canvas clicks are inert. "
+                                                                    "Edit Mode: click / paint / drag "
+                                                                    "to refine or inpaint the cached "
+                                                                    "base. Switching to Edit Mode auto-"
+                                                                    "locks sampler_seed_control to "
+                                                                    "'fixed' so the base stays stable."}),
                 "sampler_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
                                          "control_after_generate": False,
                                          "tooltip": "[Sampler Mode] Seed for the base generation. "
@@ -889,17 +951,15 @@ class AngeloRefine:
                                              "controlled by the Seed Ctrl dropdown on the toolbar. "
                                              "Defaults to randomize so each refine click produces a "
                                              "fresh variation rather than repeating the same result."}),
-                "steps": ("INT", {"default": 4, "min": 1, "max": 100,
-                                  "tooltip": "Match the model's expected step count. "
-                                             "FLUX 2 Klein distilled = 4."}),
-                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1,
-                                  "tooltip": "FLUX 2 Klein distilled uses CFG=1 (no negative)."}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
                 "denoise": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 1.0, "step": 0.05,
-                                      "tooltip": "How much noise to add back for the refinement. "
+                                      "tooltip": "How much of the sigma schedule to use for each "
+                                                 "refine click (Edit Mode). The provided sigmas are "
+                                                 "truncated to the last round(N×denoise)+1 values so "
+                                                 "the sampler starts at the right noise level. "
                                                  "0.3 = subtle touch-up, 0.6 = real redo, "
-                                                 "0.9+ = essentially regenerate that region."}),
+                                                 "0.9+ = essentially regenerate that region. "
+                                                 "Connect BasicScheduler(denoise=1.0) for best "
+                                                 "truncation accuracy."}),
 
                 "click_radius": ("INT", {"default": 96, "min": 8, "max": 1024, "step": 4,
                                          "tooltip": "Pixel-space radius of the refinement region. "
@@ -978,27 +1038,27 @@ class AngeloRefine:
                                                                             "exact preserves exact sample values; "
                                                                             "area/bislerp niche."}),
                 "inpainting_mode": (["Refine", "Smart Inpaint", "Smart Guided Inpaint"], {"default": "Refine",
-                                                                  "tooltip": "How the painted region is treated.\n\n"
-                                                                             "Refine — the painted region is partially "
-                                                                             "denoised from the existing content. Best "
-                                                                             "for refining what's already there (faces, "
-                                                                             "hands, textures). Paint/click as normal.\n\n"
-                                                                             "Smart Inpaint — adds NEW content where you "
-                                                                             "drag a rectangle. Click+hold one corner, "
-                                                                             "release at the opposite corner. Locks "
-                                                                             "denoise=1.0, Fine Upscale=ON, Ctx Pad=0 "
-                                                                             "(the right defaults for adding new subjects "
-                                                                             "with an edit model — Klein 9B etc.). "
-                                                                             "Reference_latents are auto-injected so the "
-                                                                             "model's edit branch activates.\n\n"
-                                                                             "Smart Guided Inpaint — no painting or boxes. "
-                                                                             "Pick a location from the dropdown above the "
-                                                                             "Area Prompt; it's prepended to your prompt "
-                                                                             "(e.g. 'In the top left of the image, ...') "
-                                                                             "and the edit model places the content there "
-                                                                             "across the whole image. Locks denoise=1.0, "
-                                                                             "Fine Upscale=OFF, Area Prompt=ON; press "
-                                                                             "'Generate Guided Edit' to run."}),
+                                                                                          "tooltip": "How the painted region is treated.\n\n"
+                                                                                                     "Refine — the painted region is partially "
+                                                                                                     "denoised from the existing content. Best "
+                                                                                                     "for refining what's already there (faces, "
+                                                                                                     "hands, textures). Paint/click as normal.\n\n"
+                                                                                                     "Smart Inpaint — adds NEW content where you "
+                                                                                                     "drag a rectangle. Click+hold one corner, "
+                                                                                                     "release at the opposite corner. Locks "
+                                                                                                     "denoise=1.0, Fine Upscale=ON, Ctx Pad=0 "
+                                                                                                     "(the right defaults for adding new subjects "
+                                                                                                     "with an edit model — Klein 9B etc.). "
+                                                                                                     "Reference_latents are auto-injected so the "
+                                                                                                     "model's edit branch activates.\n\n"
+                                                                                                     "Smart Guided Inpaint — no painting or boxes. "
+                                                                                                     "Pick a location from the dropdown above the "
+                                                                                                     "Area Prompt; it's prepended to your prompt "
+                                                                                                     "(e.g. 'In the top left of the image, ...') "
+                                                                                                     "and the edit model places the content there "
+                                                                                                     "across the whole image. Locks denoise=1.0, "
+                                                                                                     "Fine Upscale=OFF, Area Prompt=ON; press "
+                                                                                                     "'Generate Guided Edit' to run."}),
 
                 # Hidden — DOM location dropdown (Smart Guided Inpaint)
                 # drives this. Holds a LABEL key from
@@ -1007,17 +1067,17 @@ class AngeloRefine:
                 "guided_location": ("STRING", {"default": "(none)", "multiline": False}),
 
                 "fine_context_pad": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8,
-                                              "tooltip": "[Fine Upscale] Pixel-space padding around the "
-                                                         "painted-shape bbox before cropping. Gives the "
-                                                         "model surrounding context (skin, hair, "
-                                                         "background) so a tight face mask at high denoise "
-                                                         "still produces a coherent face that matches its "
-                                                         "surroundings. The painted shape is unchanged — "
-                                                         "only the area the model SEES grows. Outside the "
-                                                         "painted shape, the surrounding pixels are "
-                                                         "preserved (not refined). Larger pad = more "
-                                                         "context + less effective resolution on the "
-                                                         "painted area (bump MP to compensate)."}),
+                                             "tooltip": "[Fine Upscale] Pixel-space padding around the "
+                                                        "painted-shape bbox before cropping. Gives the "
+                                                        "model surrounding context (skin, hair, "
+                                                        "background) so a tight face mask at high denoise "
+                                                        "still produces a coherent face that matches its "
+                                                        "surroundings. The painted shape is unchanged — "
+                                                        "only the area the model SEES grows. Outside the "
+                                                        "painted shape, the surrounding pixels are "
+                                                        "preserved (not refined). Larger pad = more "
+                                                        "context + less effective resolution on the "
+                                                        "painted area (bump MP to compensate)."}),
 
                 "persistent_mask": ("BOOLEAN", {"default": False,
                                                 "tooltip": "When ON, the last mask used (click point or paint "
@@ -1138,57 +1198,54 @@ class AngeloRefine:
     )
 
     def run(
-        self,
-        model,
-        positive,
-        negative,
-        vae,
-        mode,
-        sampler_denoise,
-        sampler_seed,
-        sampler_seed_control,
-        seed,
-        seed_control,
-        steps,
-        cfg,
-        sampler_name,
-        scheduler,
-        denoise,
-        click_radius,
-        feather_radius,
-        click_x,
-        click_y,
-        click_seq,
-        image_w,
-        image_h,
-        undo_seq,
-        reset,
-        auto_decode,
-        fine_upscaling,
-        min_megapixels,
-        max_upscale,
-        resize_method,
-        inpainting_mode,
-        fine_context_pad,
-        persistent_mask,
-        paint_mode,
-        stroke_points,
-        rect_points,
-        area_prompt,
-        guided_location="(none)",
-        area_text_positive="",
-        area_text_negative="",
-        loaded_image="",
-        loaded_image_seq=0,
-        loaded_resize_mode="keep",
-        loaded_target_mp=1.5,
-        seg_polygon="",
-        reroll_seq=0,
-        seg_mask_png="",
-        redo_seq=0,
-        latent=None,
-        clip=None,
-        unique_id=None,
+            self,
+            guider,
+            sampler,
+            sigmas,
+            positive,
+            negative,
+            vae,
+            mode,
+            sampler_seed,
+            sampler_seed_control,
+            seed,
+            seed_control,
+            denoise,
+            click_radius,
+            feather_radius,
+            click_x,
+            click_y,
+            click_seq,
+            image_w,
+            image_h,
+            undo_seq,
+            reset,
+            auto_decode,
+            fine_upscaling,
+            min_megapixels,
+            max_upscale,
+            resize_method,
+            inpainting_mode,
+            fine_context_pad,
+            persistent_mask,
+            paint_mode,
+            stroke_points,
+            rect_points,
+            area_prompt,
+            guided_location="(none)",
+            area_text_positive="",
+            area_text_negative="",
+            loaded_image="",
+            loaded_image_seq=0,
+            loaded_resize_mode="keep",
+            loaded_target_mp=1.5,
+            seg_polygon="",
+            reroll_seq=0,
+            seg_mask_png="",
+            redo_seq=0,
+            latent=None,
+            clip=None,
+            unique_id=None,
     ):
         node_id = str(unique_id)
         with _STATE_LOCK:
@@ -1208,7 +1265,7 @@ class AngeloRefine:
         loaded_active = bool(loaded_ref)
         loaded_seq = int(loaded_image_seq)
         new_loaded = loaded_active and (
-            state is None or state.get("loaded_seq") != loaded_seq
+                state is None or state.get("loaded_seq") != loaded_seq
         )
         forced_base = None
         if new_loaded:
@@ -1246,8 +1303,8 @@ class AngeloRefine:
         # fix_empty_latent_channels before sampling; Angelo calls
         # comfy.sample.sample directly, so it must do this itself. The
         # load-bearing case is video/temporal VAEs (Qwen Image Edit, Wan):
-        # their diffusion model wants a 5D latent [B, C, T, H, W], and a 4D
-        # [B, C, H, W] base (e.g. from a plain EmptyLatentImage, or any path
+        # their diffusion model wants a 5D latent [B, C, T, H, W], and a
+        # 4D [B, C, H, W] base (e.g. from a plain EmptyLatentImage, or any path
         # that didn't go through a Qwen-aware latent node) makes process_img
         # fail with "not enough values to unpack (expected 5, got 4)". This
         # unsqueezes the temporal axis (and channel-pads an empty latent) for
@@ -1255,7 +1312,7 @@ class AngeloRefine:
         # and an already-5D latent is returned unchanged. Done once here so
         # every downstream path — Sampler Mode, the Edit-Mode history seed,
         # the fingerprint, and the refine round-trips — sees the right shape.
-        incoming = comfy.sample.fix_empty_latent_channels(model, incoming)
+        incoming = comfy.sample.fix_empty_latent_channels(guider.model_patcher, incoming)
         incoming_fp = _latent_fingerprint(incoming)
 
         # ===== Smart Inpaint locks =====
@@ -1296,17 +1353,18 @@ class AngeloRefine:
         # the result as the new base. All toolbar / canvas / refine logic is
         # skipped — those are Edit Mode concerns.
         if mode == "Sampler Mode":
-            callback = latent_preview.prepare_callback(model, steps)
+            base_steps = max(1, len(sigmas) - 1)
+            callback = latent_preview.prepare_callback(guider.model_patcher, base_steps)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
             noise = comfy.sample.prepare_noise(incoming, sampler_seed, None)
-            new_latent = comfy.sample.sample(
-                model, noise, steps, cfg, sampler_name, scheduler,
-                positive, negative, incoming,
-                denoise=sampler_denoise,
+            base_g = _guider_with_conds(guider, positive, negative)
+            new_latent = _guider_sample(
+                base_g, noise, incoming, sampler, sigmas,
                 callback=callback,
                 disable_pbar=disable_pbar,
                 seed=sampler_seed,
             )
+            new_latent = new_latent.to(comfy.model_management.intermediate_device())
             # Replace the cache with the freshly-sampled base. Drops the
             # undo history (it's irrelevant — we have a brand-new image).
             #
@@ -1374,15 +1432,15 @@ class AngeloRefine:
         with _STATE_LOCK:
             state = _STATE.get(node_id)
         fingerprint_changed = (
-            base_from_wired_latent
-            and state is not None
-            and state.get("fingerprint") != incoming_fp
+                base_from_wired_latent
+                and state is not None
+                and state.get("fingerprint") != incoming_fp
         )
         need_reset = (
-            reset
-            or state is None
-            or new_loaded
-            or (fingerprint_changed and not persistent_mask)
+                reset
+                or state is None
+                or new_loaded
+                or (fingerprint_changed and not persistent_mask)
         )
 
         if need_reset:
@@ -1475,9 +1533,9 @@ class AngeloRefine:
 
         # Has the user clicked since our last execution for this node?
         new_click = (
-            click_x >= 0
-            and click_y >= 0
-            and click_seq != state["click_seq"]
+                click_x >= 0
+                and click_y >= 0
+                and click_seq != state["click_seq"]
         )
 
         # Source latent for every edit is the current cached latent, so all
@@ -1632,7 +1690,15 @@ class AngeloRefine:
             # widget locked, click_seq's increment still moved the effective
             # sampling seed. Now the user has explicit control.
             this_seed = int(seed)
-            callback = latent_preview.prepare_callback(model, steps)
+            # Kursat Note!!!
+            # Derive the actual step count from the sigmas + denoise so the
+            # progress bar matches reality. The sampler runs
+            # len(refine_sigmas)-1 steps, where refine_sigmas is the truncated
+            # schedule. Using the `steps` widget here was wrong: it only
+            # controls the progress bar, not the actual step count, so a
+            # mismatch produced a jumpy / incorrect progress display.
+            _refine_steps = max(1, round((len(sigmas) - 1) * denoise))
+            callback = latent_preview.prepare_callback(guider.model_patcher, _refine_steps)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
             # Source latent = the current cached latent for every path (see
@@ -1660,29 +1726,30 @@ class AngeloRefine:
 
             if fine_upscaling:
                 refined, refined_pixels = _refine_with_fine_upscaling(
-                    model=model, vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
+                    guider=guider, sampler=sampler, sigmas=sigmas,
+                    vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
                     scale_x=scale_x, scale_y=scale_y,
                     target_mp=float(min_megapixels),
                     max_linear=float(max_upscale),
                     resize_method=str(resize_method),
                     context_pad_pixel=int(fine_context_pad),
                     inpainting_mode=str(inpainting_mode),
-                    seed=this_seed, steps=steps, cfg=cfg,
-                    sampler_name=sampler_name, scheduler=scheduler,
+                    seed=this_seed,
                     positive=refine_positive, negative=refine_negative,
                     denoise=denoise, callback=callback, disable_pbar=disable_pbar,
                 )
             else:
                 noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
-                refined = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
-                    refine_positive, refine_negative, refine_source,
-                    denoise=denoise,
-                    noise_mask=mask,
+                refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
+                temp_g = _guider_with_conds(guider, refine_positive, refine_negative)
+                refined = _guider_sample(
+                    temp_g, noise, refine_source, sampler, refine_sigmas,
+                    denoise_mask=mask,
                     callback=callback,
                     disable_pbar=disable_pbar,
                     seed=this_seed,
                 )
+                refined = refined.to(comfy.model_management.intermediate_device())
                 refined_pixels = None
 
             state["history"].append((refined, refined_pixels))
@@ -1701,7 +1768,7 @@ class AngeloRefine:
             "Angelo_mode": ["Edit Mode"],
             "Angelo_refine_seed_at_run": [int(state.get("refine_seed_at_run", seed))],
         }
-        
+
         if current_pixels is not None:
             image = current_pixels
             previewer = comfy_nodes.PreviewImage()
@@ -1733,5 +1800,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AngeloRefine": "Angelo — click to refine",
+    "AngeloRefine": "Angelo - Sampler Custom",
 }
+
