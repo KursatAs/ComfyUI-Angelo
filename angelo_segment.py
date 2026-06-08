@@ -36,6 +36,12 @@ _STATE = {
 _SAM3_HF_REPO = "1038lab/sam3"
 _SAM3_CKPT_NAME = "sam3.pt"
 
+# SHA256 of the current 1038lab/sam3 sam3.pt checkpoint.
+# Used to reject corrupted or tampered downloads before they get loaded
+# via torch.load (which executes arbitrary pickle payloads). If the
+# upstream mirror ever republishes with a new file, update this value.
+_SAM3_CHECKPOINT_SHA256 = "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
+
 
 def _torch_devices():
     import comfy.model_management as mm
@@ -46,6 +52,31 @@ def _checkpoint_path():
     """Absolute path where sam3.pt should live (<models>/sam3/sam3.pt)."""
     import folder_paths
     return os.path.join(folder_paths.models_dir, "sam3", _SAM3_CKPT_NAME)
+
+
+def _verify_checkpoint(path: str) -> None:
+    """Compute the SHA256 of the file at `path` and compare it against the
+    known-good value in _SAM3_CHECKPOINT_SHA256. Raises RuntimeError on a
+    mismatch so the caller can discard the bad file and surface a clear
+    error — prevents a corrupted or tampered checkpoint from reaching
+    torch.load (which executes arbitrary pickle code)."""
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(1 << 20)   # 1 MiB chunks
+            if not block:
+                break
+            digest.update(block)
+    computed = digest.hexdigest()
+    if computed != _SAM3_CHECKPOINT_SHA256:
+        raise RuntimeError(
+            f"[Angelo/SAM3] Integrity check failed for {os.path.basename(path)}.\n"
+            f"  expected : {_SAM3_CHECKPOINT_SHA256}\n"
+            f"  got      : {computed}\n"
+            "The downloaded file may be corrupted or tampered with. "
+            "The bad copy will be removed so the next Detect attempt retries the download."
+        )
 
 
 def _download_checkpoint(target_path):
@@ -64,6 +95,18 @@ def _download_checkpoint(target_path):
         local_dir=target_dir,
         local_dir_use_symlinks=False,
     )
+
+    # Integrity gate — verify before moving into the models directory.
+    # A mismatched hash deletes the bad file so the next run retries cleanly.
+    try:
+        _verify_checkpoint(downloaded)
+    except RuntimeError:
+        try:
+            os.remove(downloaded)
+        except OSError:
+            pass
+        raise
+
     if os.path.normpath(downloaded) != os.path.normpath(target_path):
         shutil.move(downloaded, target_path)
     print(f"[Angelo/SAM3] Downloaded to {target_path}")
@@ -328,16 +371,28 @@ if _HAS_SERVER:
         except Exception as e:
             return web.json_response({"error": f"could not load preview: {e}"}, status=400)
 
-        # Run the (blocking, GPU) detection off the event loop.
+        # Run the (blocking, GPU) detection off the event loop so we don't
+        # freeze ComfyUI's async server while SAM 3 runs inference.
+        # On some CUDA configurations (WSL, certain container setups) the
+        # executor thread fails to allocate VRAM on its first run despite
+        # there being enough free — CUDA's per-thread context setup doesn't
+        # always inherit the main thread's allocator state. In that specific
+        # case we fall back to a direct (main-thread, blocking) call; it
+        # stalls the event loop briefly but unblocks the user rather than
+        # returning a 500 error.
         import asyncio
-        # asyncio.get_event_loop() is deprecated in Python 3.10+ when called
-        # from within a running async context. Use get_running_loop() instead.
+        import torch
         loop = asyncio.get_running_loop()
         try:
             if method == "sam3_text":
-                result = await loop.run_in_executor(
-                    None, detect_text, pil, text, threshold, max_det
-                )
+                try:
+                    result = await loop.run_in_executor(
+                        None, detect_text, pil, text, threshold, max_det
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    print("[Angelo/SAM3] Executor thread hit CUDA OOM — "
+                          "retrying synchronously on the main thread.")
+                    result = detect_text(pil, text, threshold, max_det)
             else:
                 return web.json_response({"error": f"unknown method '{method}'"}, status=400)
         except Exception as e:
