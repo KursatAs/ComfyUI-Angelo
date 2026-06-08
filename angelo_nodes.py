@@ -114,12 +114,7 @@ def _guider_sample(
         disable_pbar=disable_pbar,
         seed=seed,
     )
-    # Move result back to intermediate_device so downstream pipeline
-    # (VAE decode, pixel composite, latent blend in Fine Upscale) sees
-    # the same device as cached_pixels / mask. Without this the guider
-    # path returns on load_device (GPU) while those buffers are on
-    # intermediate_device (CPU), crashing the composite step with a
-    # device-mismatch RuntimeError when Xtra-Fine is on.
+
     return samples.to(
         device=comfy.model_management.intermediate_device(),
         dtype=comfy.model_management.intermediate_dtype(),
