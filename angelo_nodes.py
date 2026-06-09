@@ -36,9 +36,15 @@ import numpy as np
 import torch
 from PIL import Image as _PILImage, ImageDraw as _PILImageDraw, ImageOps as _PILImageOps
 
+# Pillow ≥ 10.0 moved resampling filters to Image.Resampling.*
+# Support both old (<10) and new (≥10) APIs without deprecation warnings.
+_LANCZOS = getattr(_PILImage, "Resampling", _PILImage).LANCZOS
+_BILINEAR = getattr(_PILImage, "Resampling", _PILImage).BILINEAR
+
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+import comfy.model_management
 import latent_preview
 import folder_paths
 import node_helpers
@@ -56,6 +62,7 @@ import nodes as comfy_nodes
 #     "source_latent": Tensor,     # session base latent, for the source_image output
 #     "source_pixels": Tensor|None,# decoded source base (lazy, cached)
 #     "fingerprint": str,          # hash of incoming latent; mismatch = upstream changed
+#     "last_mask": Tensor|None,    # most recent [1,H,W] refine mask, for the MASK output
 #   }
 _STATE: dict[str, dict] = {}
 
@@ -142,7 +149,10 @@ def _truncate_sigmas_for_denoise(sigmas: torch.Tensor, denoise: float) -> torch.
 
 
 # Max number of latents to keep in the undo stack per node. Each FLUX 2
-# latent at 832x1776 is ~180 KB (bf16); 10 = ~1.8 MB per node. Cheap.
+# latent at 832x1776 is ~180 KB (bf16). However, the history also caches
+# the decoded pixel tensor when available (~17 MB per entry at float32).
+# 10 entries can therefore use up to ~176 MB per active node. Reduce this
+# value on low-VRAM / low-RAM systems.
 _HISTORY_CAP: int = 10
 
 # Valid resize methods for the Fine Upscaling crop. All routed through
@@ -268,9 +278,9 @@ def _stroke_mask_latent(
 def _parse_rect_points(raw: str) -> tuple[float, float, float, float] | None:
     """Parse the JS-set rect_points widget — JSON list of one or more
     [x1, y1, x2, y2] entries in image-pixel coords. We use only the
-    LAST rectangle (the most recent drag); earlier entries are kept
-    in the widget history for the undo stack to consume but don't
-    affect mask building. Returns None for empty / malformed input.
+    LAST rectangle (the most recent drag). In practice the JS always
+    writes a single-item list; the list format is kept for forward
+    compatibility. Returns None for empty / malformed input.
     """
     raw = (raw or "").strip()
     if not raw:
@@ -365,7 +375,7 @@ def _raster_mask_latent(latent_h, latent_w, png_b64, device):
     silhouette can't. Resized straight to the latent grid (no scale args)."""
     raw = base64.b64decode(png_b64)
     img = _PILImage.open(io.BytesIO(raw)).convert("L")
-    img = img.resize((latent_w, latent_h), _PILImage.BILINEAR)
+    img = img.resize((latent_w, latent_h), _BILINEAR)
     arr = np.array(img, dtype=np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...].to(device)
 
@@ -562,7 +572,7 @@ def _refine_with_fine_upscaling(
             disable_pbar=disable_pbar,
             seed=seed,
         )
-        new_latent = new_latent.to(comfy.model_management.intermediate_device())
+        # _guider_sample already moves the result to intermediate_device().
         # Return None for pixels because the latent was modified directly;
         # this forces a fresh VAE decode for the preview in the main run() method.
         return new_latent, None
@@ -597,12 +607,13 @@ def _refine_with_fine_upscaling(
     bbox_h_p = y1_p - y0_p
     bbox_w_p = x1_p - x0_p
 
-    # Upscaled target dims in pixel space. Snap to multiples of the
-    # VAE downscale (16 for FLUX 2) so the subsequent VAE encode
-    # produces a clean integer-dim latent.
-    vae_snap = max(px_per_lat_y, px_per_lat_x)
-    target_h_p = max(vae_snap, math.ceil(bbox_h_p * scale / vae_snap) * vae_snap)
-    target_w_p = max(vae_snap, math.ceil(bbox_w_p * scale / vae_snap) * vae_snap)
+    # Upscaled target dims in pixel space. Snap each axis independently to
+    # a multiple of that axis's VAE downscale factor so the subsequent VAE
+    # encode produces a clean integer-dim latent. Using the per-axis ratio
+    # (instead of max of both) prevents over-snapping in the smaller axis
+    # on non-square VAEs (e.g. temporal models where px_per_lat_y ≠ px_per_lat_x).
+    target_h_p = max(px_per_lat_y, math.ceil(bbox_h_p * scale / px_per_lat_y) * px_per_lat_y)
+    target_w_p = max(px_per_lat_x, math.ceil(bbox_w_p * scale / px_per_lat_x) * px_per_lat_x)
 
     print(f"[Angelo fine-upscale] bbox_lat=(h={bbox_h_lat}, w={bbox_w_lat}) "
           f"bbox_px=(h={bbox_h_p}, w={bbox_w_p}) scale={scale:.2f} "
@@ -702,7 +713,7 @@ def _refine_with_fine_upscaling(
         disable_pbar=disable_pbar,
         seed=seed,
     )
-    refined_latent_up = refined_latent_up.to(comfy.model_management.intermediate_device())
+    # _guider_sample already moves the result to intermediate_device().
 
     # ----- VAE decode refined latent → high-res pixel patch -----
     refined_pixel_up = _vae_decode(vae, refined_latent_up)  # (B, target_h_p, target_w_p, C)
@@ -870,7 +881,7 @@ def _encode_loaded_image(vae, ref_json: str, resize_mode: str, target_mp: float)
     w = max(16, (w // 16) * 16)
     h = max(16, (h // 16) * 16)
     if (w, h) != img.size:
-        img = img.resize((w, h), _PILImage.LANCZOS)
+        img = img.resize((w, h), _LANCZOS)
 
     arr = np.array(img).astype(np.float32) / 255.0  # (H, W, 3)
     pixels = torch.from_numpy(arr)[None, ...]  # (1, H, W, 3)
@@ -1191,8 +1202,8 @@ class AngeloRefine:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "LATENT", "IMAGE")
-    RETURN_NAMES = ("image", "latent", "source_image")
+    RETURN_TYPES = ("IMAGE", "LATENT", "IMAGE", "MASK")
+    RETURN_NAMES = ("image", "latent", "source_image", "mask")
     FUNCTION = "run"
     OUTPUT_NODE = True
     CATEGORY = "sampling/Angelo"
@@ -1369,7 +1380,7 @@ class AngeloRefine:
                 disable_pbar=disable_pbar,
                 seed=sampler_seed,
             )
-            new_latent = new_latent.to(comfy.model_management.intermediate_device())
+            # _guider_sample already moves the result to intermediate_device().
             # Replace the cache with the freshly-sampled base. Drops the
             # undo history (it's irrelevant — we have a brand-new image).
             #
@@ -1413,7 +1424,12 @@ class AngeloRefine:
             ui_msg["Angelo_preview"] = image_refs
             # Freshly-generated base IS the source image — cache + emit it.
             _STATE[node_id]["source_pixels"] = image
-            return {"ui": ui_msg, "result": (image, out_latent, image)}
+            # No refine mask in Sampler Mode — return a zero mask at latent resolution.
+            empty_mask = torch.zeros(
+                (new_latent.shape[-2], new_latent.shape[-1]),
+                device=new_latent.device, dtype=torch.float32,
+            )
+            return {"ui": ui_msg, "result": (image, out_latent, image, empty_mask)}
 
         # ===== Edit Mode branch (existing behaviour) =====
 
@@ -1472,77 +1488,98 @@ class AngeloRefine:
                 }
             state = _STATE[node_id]
 
-        # Undo: if undo_seq advanced and we have history to pop, pop it.
-        # We always keep at least one latent (the base / earliest refine)
-        # so the preview stays valid.
-        new_undo = undo_seq > 0 and undo_seq != state.get("undo_seq", -1)
-        if new_undo:
-            if len(state["history"]) > 1:
-                # Move the popped entry onto the redo stack so Redo (#6) can
-                # restore it. Bounded like the history stack.
-                popped = state["history"].pop()
-                redo = state.setdefault("redo_stack", [])
-                redo.append(popped)
-                if len(redo) > _HISTORY_CAP:
-                    state["redo_stack"] = redo[-_HISTORY_CAP:]
-            state["undo_seq"] = undo_seq
-            # Undo is a PURE restore — pop the cached latent and decode it.
-            # It must NEVER re-sample, or it would produce a different image
-            # than the one being restored. Absorb the current click_seq so
-            # the new-click gate below stays False on this run. This is
-            # load-bearing because the Persistent Mask queue hook bumps
-            # click_seq on EVERY queue, including the Undo button's — without
-            # this, an undo while Persistent Mask is on would look like a new
-            # click and re-run the last mask with the (since-randomized) seed,
-            # restoring the WRONG result. (Harmless no-op when the hook didn't
-            # bump it.)
-            state["click_seq"] = click_seq
+        # ===== Edit Mode: per-node lock around all state mutations =====
+        # ComfyUI is typically serial, but rapid re-queues can overlap.
+        # _node_lock(node_id) is a per-node threading.Lock that prevents
+        # concurrent runs from corrupting the shared history/undo/redo stacks.
+        # Pattern:
+        #   1. Acquire lock → pure state mutations (undo/redo/reroll, current read)
+        #   2. Release lock → slow GPU sampling
+        #   3. Acquire lock → write results back to history
 
-        # ===== Redo (#6): restore an entry Undo moved to the redo stack =====
-        # A PURE restore — never re-samples — and runs BEFORE `current` is read
-        # below, so the restored entry becomes history[-1]. Absorbs click_seq
-        # for the same reason Undo does (the Persistent Mask queue hook bumps
-        # it on every queue, including the Redo button's). No-op if the redo
-        # stack is empty. A genuine new edit clears the redo stack (below).
-        new_redo = redo_seq > 0 and redo_seq != state.get("redo_seq", -1)
-        if new_redo:
-            redo = state.get("redo_stack") or []
-            if redo:
-                state["history"].append(redo.pop())
-                if len(state["history"]) > _HISTORY_CAP:
-                    state["history"] = state["history"][-_HISTORY_CAP:]
-            state["redo_seq"] = redo_seq
-            state["click_seq"] = click_seq
+        node_lock = _node_lock(node_id)
 
-        # ===== Re-roll: redo the most recent edit with a fresh seed =====
-        # The Re-roll button bumps reroll_seq (and sets a new seed) without
-        # touching the mask widgets. Re-run the SAME mask on the SAME pre-
-        # edit base and swap the result in place of the last attempt — so
-        # the user can cycle seeds on one edit without reset → re-mask →
-        # rerun. Implemented as "pop the last refine to expose its pre-edit
-        # base as history[-1]"; the edit block below then re-runs from there
-        # and appends the fresh variation, restoring the stack depth (net
-        # effect: replace, not stack). No-op if there's no prior edit yet.
-        new_reroll = reroll_seq > 0 and reroll_seq != state.get("reroll_seq", -1)
-        reroll_now = new_reroll and len(state["history"]) > 1
-        if reroll_now:
-            state["history"].pop()
-        state["reroll_seq"] = reroll_seq
+        # --- Step 1: state mutations under per-node lock ---
+        new_click = False
+        reroll_now = False
+        current = None
+        current_pixels = None
 
-        hist_last = state["history"][-1]
-        if isinstance(hist_last, tuple):
-            current, current_pixels = hist_last
-        else:
-            current = hist_last
-            current_pixels = None
+        with node_lock:
+            state = _STATE.get(node_id)
 
-        # Has the user clicked since our last execution for this node?
-        new_click = (
-                click_x >= 0
-                and click_y >= 0
-                and click_seq != state["click_seq"]
-        )
+            # Undo: if undo_seq advanced and we have history to pop, pop it.
+            # We always keep at least one latent (the base / earliest refine)
+            # so the preview stays valid.
+            new_undo = undo_seq > 0 and undo_seq != state.get("undo_seq", -1)
+            if new_undo:
+                if len(state["history"]) > 1:
+                    # Move the popped entry onto the redo stack so Redo (#6) can
+                    # restore it. Bounded like the history stack.
+                    popped = state["history"].pop()
+                    redo = state.setdefault("redo_stack", [])
+                    redo.append(popped)
+                    if len(redo) > _HISTORY_CAP:
+                        state["redo_stack"] = redo[-_HISTORY_CAP:]
+                state["undo_seq"] = undo_seq
+                # Undo is a PURE restore — pop the cached latent and decode it.
+                # It must NEVER re-sample, or it would produce a different image
+                # than the one being restored. Absorb the current click_seq so
+                # the new-click gate below stays False on this run. This is
+                # load-bearing because the Persistent Mask queue hook bumps
+                # click_seq on EVERY queue, including the Undo button's — without
+                # this, an undo while Persistent Mask is on would look like a new
+                # click and re-run the last mask with the (since-randomized) seed,
+                # restoring the WRONG result. (Harmless no-op when the hook didn't
+                # bump it.)
+                state["click_seq"] = click_seq
 
+            # ===== Redo (#6): restore an entry Undo moved to the redo stack =====
+            # A PURE restore — never re-samples — and runs BEFORE `current` is read
+            # below, so the restored entry becomes history[-1]. Absorbs click_seq
+            # for the same reason Undo does (the Persistent Mask queue hook bumps
+            # it on every queue, including the Redo button's). No-op if the redo
+            # stack is empty. A genuine new edit clears the redo stack (below).
+            new_redo = redo_seq > 0 and redo_seq != state.get("redo_seq", -1)
+            if new_redo:
+                redo = state.get("redo_stack") or []
+                if redo:
+                    state["history"].append(redo.pop())
+                    if len(state["history"]) > _HISTORY_CAP:
+                        state["history"] = state["history"][-_HISTORY_CAP:]
+                state["redo_seq"] = redo_seq
+                state["click_seq"] = click_seq
+
+            # ===== Re-roll: redo the most recent edit with a fresh seed =====
+            # The Re-roll button bumps reroll_seq (and sets a new seed) without
+            # touching the mask widgets. Re-run the SAME mask on the SAME pre-
+            # edit base and swap the result in place of the last attempt — so
+            # the user can cycle seeds on one edit without reset → re-mask →
+            # rerun. Implemented as "pop the last refine to expose its pre-edit
+            # base as history[-1]"; the edit block below then re-runs from there
+            # and appends the fresh variation, restoring the stack depth (net
+            # effect: replace, not stack). No-op if there's no prior edit yet.
+            new_reroll = reroll_seq > 0 and reroll_seq != state.get("reroll_seq", -1)
+            reroll_now = new_reroll and len(state["history"]) > 1
+            if reroll_now:
+                state["history"].pop()
+            state["reroll_seq"] = reroll_seq
+
+            hist_last = state["history"][-1]
+            if isinstance(hist_last, tuple):
+                current, current_pixels = hist_last
+            else:
+                current = hist_last
+                current_pixels = None
+
+            # Has the user clicked since our last execution for this node?
+            new_click = (
+                    click_x >= 0
+                    and click_y >= 0
+                    and click_seq != state["click_seq"]
+            )
+
+        # --- Step 2: GPU sampling outside the lock ---
         # Source latent for every edit is the current cached latent, so all
         # paths build ON TOP of the previous result:
         #   - normal clicks / paints iterate on the latest image
@@ -1554,6 +1591,10 @@ class AngeloRefine:
         # popped the last attempt above, so `current` is now that attempt's
         # PRE-edit base — re-running from here gives a fresh variation on the
         # ORIGINAL image, swapped in for the last attempt instead of stacked.
+
+        _refined = None
+        _refined_pixels = None
+        _this_mask = None
 
         if new_click or reroll_now:
             # A re-roll re-runs the same mask widgets from the popped pre-
@@ -1647,6 +1688,8 @@ class AngeloRefine:
                 mask = _gaussian_blur_2d(mask, max(0.5, sigma_latent))
                 mask = mask.clamp(0.0, 1.0)
 
+            _this_mask = mask  # capture for state write + MASK output
+
             # Area-prompt conditioning selection. When area_prompt is on AND a
             # CLIP is connected, the refine uses the AREA text ONLY and NEVER
             # the main prompt — even when the Area text is empty, in which case
@@ -1695,7 +1738,6 @@ class AngeloRefine:
             # widget locked, click_seq's increment still moved the effective
             # sampling seed. Now the user has explicit control.
             this_seed = int(seed)
-            # Kursat Note!!!
             # Derive the actual step count from the sigmas + denoise so the
             # progress bar matches reality. The sampler runs
             # len(refine_sigmas)-1 steps, where refine_sigmas is the truncated
@@ -1730,7 +1772,7 @@ class AngeloRefine:
                 )
 
             if fine_upscaling:
-                refined, refined_pixels = _refine_with_fine_upscaling(
+                _refined, _refined_pixels = _refine_with_fine_upscaling(
                     guider=guider, sampler=sampler, sigmas=sigmas,
                     vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
                     scale_x=scale_x, scale_y=scale_y,
@@ -1747,25 +1789,34 @@ class AngeloRefine:
                 noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
                 refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
                 temp_g = _guider_with_conds(guider, refine_positive, refine_negative)
-                refined = _guider_sample(
+                _refined = _guider_sample(
                     temp_g, noise, refine_source, sampler, refine_sigmas,
                     denoise_mask=mask,
                     callback=callback,
                     disable_pbar=disable_pbar,
                     seed=this_seed,
                 )
-                refined = refined.to(comfy.model_management.intermediate_device())
-                refined_pixels = None
+                # _guider_sample already moves the result to intermediate_device().
+                _refined_pixels = None
 
-            state["history"].append((refined, refined_pixels))
-            if len(state["history"]) > _HISTORY_CAP:
-                state["history"] = state["history"][-_HISTORY_CAP:]
-            # A genuine new edit (click or re-roll) invalidates the redo branch.
-            state["redo_stack"] = []
-            state["click_seq"] = click_seq
-            state["refine_seed_at_run"] = int(seed)
-            current = refined
-            current_pixels = refined_pixels
+        # --- Step 3: write results back to state under per-node lock ---
+        with node_lock:
+            state = _STATE.get(node_id)
+            if _refined is not None:
+                state["history"].append((_refined, _refined_pixels))
+                if len(state["history"]) > _HISTORY_CAP:
+                    state["history"] = state["history"][-_HISTORY_CAP:]
+                # A genuine new edit (click or re-roll) invalidates the redo branch.
+                state["redo_stack"] = []
+                state["click_seq"] = click_seq
+                state["refine_seed_at_run"] = int(seed)
+                state["last_mask"] = _this_mask
+                current = _refined
+                current_pixels = _refined_pixels
+            elif _this_mask is not None:
+                # Mask was built but sampling raised — still update last_mask
+                # so the MASK output reflects what was attempted.
+                state["last_mask"] = _this_mask
 
         out_latent = {"samples": current}
         ui_msg = {
@@ -1797,7 +1848,19 @@ class AngeloRefine:
             source_image = _vae_decode(vae, src_latent)
             state["source_pixels"] = source_image
 
-        return {"ui": ui_msg, "result": (image, out_latent, source_image)}
+        # MASK output: return the most recently computed refine mask so
+        # downstream nodes (compositing, secondary inpaint, etc.) can use it.
+        # last_mask is [1, H, W] float; squeeze to [H, W] for the MASK type.
+        out_mask = state.get("last_mask")
+        if out_mask is None:
+            out_mask = torch.zeros(
+                (current.shape[-2], current.shape[-1]),
+                device=current.device, dtype=torch.float32,
+            )
+        elif out_mask.dim() == 3:
+            out_mask = out_mask.squeeze(0)
+
+        return {"ui": ui_msg, "result": (image, out_latent, source_image, out_mask)}
 
 
 NODE_CLASS_MAPPINGS = {

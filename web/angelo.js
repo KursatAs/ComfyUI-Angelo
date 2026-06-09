@@ -129,12 +129,37 @@ function installKeyboardShortcuts() {
         const modeW = findWidget(node, "mode");
         if (!modeW || String(modeW.value) !== "Edit Mode") return;
 
-        // NOTE: Undo/Redo are deliberately button-only (no Ctrl-Z / Ctrl-Y /
-        // Ctrl-Shift-Z). Binding those over the canvas clashed too much with
-        // ComfyUI's graph-level undo/redo, so the shortcuts were removed.
+        // NOTE: Undo/Redo via Ctrl-Z / Ctrl-Y are handled below. They are
+        // scoped to the Angelo canvas hover (_AngeloHoveredNode must be set),
+        // which prevents them from firing when the cursor is on the ComfyUI
+        // graph and conflicting with graph-level undo/redo.
 
         const binding = handlers[event.key];
-        if (!binding) return;
+        if (!binding) {
+            // Ctrl-Z / Ctrl-Y / Ctrl-Shift-Z — scoped Undo / Redo.
+            // Only fires when the cursor is hovering the Angelo canvas AND
+            // the node is in Edit Mode, so it won't fight ComfyUI's graph-
+            // level undo/redo when the cursor is on the graph background.
+            if ((event.ctrlKey || event.metaKey) && !event.altKey
+                    && modeW && String(modeW.value) === "Edit Mode") {
+                const isUndo = (event.key === "z" || event.key === "Z") && !event.shiftKey;
+                const isRedo = (event.key === "y" || event.key === "Y")
+                    || ((event.key === "z" || event.key === "Z") && event.shiftKey);
+                if (isUndo) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    triggerUndo(node);
+                    return;
+                }
+                if (isRedo) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    triggerRedo(node);
+                    return;
+                }
+            }
+            return;
+        }
 
         const [, name, delta, min, max, asInt, syncName] = binding;
         const w = findWidget(node, name);
@@ -364,6 +389,13 @@ app.registerExtension({
             } else if (lastMode === "Edit Mode") {
                 applyAfterGenControl(this, "seed", "seed_control");
             }
+
+            // Auto-clear the `reset` toggle once the server confirms it has
+            // processed the queue. This is more reliable than the 1-second
+            // setTimeout in triggerReset (which can fire before a slow first-
+            // run finishes loading models).
+            const resetW = findWidget(this, "reset");
+            if (resetW && resetW.value === true) setWidget(resetW, false);
         };
 
         // Reset and Undo now live on the DOM toggle bar above the canvas
@@ -677,9 +709,20 @@ function attachPreviewCanvas(node) {
     detectRow.appendChild(detText);
     node._AngeloDetectText = detText;
 
-    const detConf = makeNumberInput("Conf", { min: 0.05, max: 0.95, step: 0.05, width: 48 }, () => {});
+    const detConf = makeNumberInput("Conf", { min: 0.05, max: 0.95, step: 0.05, width: 48 }, (val) => {
+        // Persist the chosen confidence so it survives workflow reloads.
+        try { localStorage.setItem("angelo_detect_conf", String(val)); } catch (e) { /* noop */ }
+    });
     detConf.title = "Detection confidence threshold. Lower (≈0.2–0.3) finds more / fainter matches.";
-    if (detConf._AngeloInput) detConf._AngeloInput.value = "0.3";
+    // Restore previously saved confidence, falling back to 0.3.
+    if (detConf._AngeloInput) {
+        try {
+            const saved = parseFloat(localStorage.getItem("angelo_detect_conf") || "0.3");
+            detConf._AngeloInput.value = String(Math.max(0.05, Math.min(0.95, isFinite(saved) ? saved : 0.3)));
+        } catch (e) {
+            detConf._AngeloInput.value = "0.3";
+        }
+    }
     detectRow.appendChild(detConf);
     node._AngeloDetectConf = detConf;
 
@@ -760,6 +803,21 @@ function attachPreviewCanvas(node) {
     detectRow.appendChild(growReadout);
     node._AngeloMaskGrowReadout = growReadout;
     detectRow.appendChild(mkGrowBtn("+", 2, "Grow all detected masks by 2px"));
+
+    // "Unload SAM3" button — frees CPU RAM used by the cached model.
+    // Shown only after the first successful Detect. Re-clicking Detect
+    // will reload the model automatically on demand.
+    detectRow.appendChild(makeSeparator());
+    const unloadSam3Btn = makeActionButton("Unload SAM3", () => {
+        api.fetchApi("/angelo/unload_sam3", { method: "POST" })
+            .then(r => r.json())
+            .then(d => _angeloToast(d.message || "SAM 3 unloaded"))
+            .catch(() => _angeloToast("Unload SAM3 failed — see console"));
+    }, "neutral");
+    unloadSam3Btn.title = "Release the SAM 3 model from CPU RAM. "
+        + "The next Detect will reload it automatically. "
+        + "Use this to free memory on low-RAM systems between detect sessions.";
+    detectRow.appendChild(unloadSam3Btn);
 
     // ===== MODE ROW: the master Sampler/Edit switch, centred up top =====
     const modeWidget = findWidget(node, "mode");
@@ -1711,6 +1769,9 @@ function attachAreaPromptBox(node, container) {
     textarea.addEventListener("input", () => {
         const w = findWidget(node, targetWidgetName());
         if (w) setWidget(w, textarea.value);
+        // Auto-grow to fit content so the user doesn't have to drag-resize.
+        textarea.style.height = "auto";
+        textarea.style.height = textarea.scrollHeight + "px";
     });
 
     posNegBtn.addEventListener("click", (event) => {
@@ -1899,7 +1960,12 @@ function syncAreaPromptBox(node) {
     const wname = onNeg ? "area_text_negative" : "area_text_positive";
     const w = findWidget(node, wname);
     const val = w ? String(w.value ?? "") : "";
-    if (textarea.value !== val) textarea.value = val;
+    if (textarea.value !== val) {
+        textarea.value = val;
+        // Re-measure height whenever text is reloaded from the widget.
+        textarea.style.height = "auto";
+        textarea.style.height = Math.max(48, textarea.scrollHeight) + "px";
+    }
     btn.textContent = onNeg ? "Negative" : "Positive";
     btn.style.background = onNeg ? "rgba(140, 60, 60, 0.95)" : "rgba(30, 120, 80, 0.95)";
 }
@@ -2135,10 +2201,10 @@ function flashClickOverlay(node, cx, cy) {
         const elapsed = t - t0;
         const alpha = Math.max(0, 1 - elapsed / 1500);
         if (alpha <= 0) return;
-        // Redraw the underlying image then the ring on top
-        if (node._AngeloImg) {
-            ctx.drawImage(node._AngeloImg, 0, 0);
-        }
+        // Let redrawCanvasWithOverlays handle the base image + all active
+        // overlays (hover ring, paint stroke, detections), then draw the
+        // fading flash ring on top so both can coexist without flickering.
+        redrawCanvasWithOverlays(node);
         ctx.save();
         ctx.strokeStyle = `rgba(255, 200, 80, ${alpha})`;
         ctx.lineWidth = 4;
@@ -2259,7 +2325,13 @@ function hideAngeloLoading(node) {
 }
 
 function _angeloToast(message) {
+    // Deduplicate: don't stack identical toasts on top of each other.
+    const existing = document.querySelectorAll("[data-angelo-toast]");
+    for (const el of existing) {
+        if (el.textContent === message) return;
+    }
     const t = document.createElement("div");
+    t.setAttribute("data-angelo-toast", "1");
     t.textContent = message;
     t.style.cssText = "position:fixed; top:20px; right:20px; background:#333; color:#fff; "
         + "padding:10px 16px; border-radius:6px; z-index:100000; font:13px Arial,sans-serif; "
@@ -2284,9 +2356,9 @@ function triggerLoadImage(node) {
 }
 
 // ---- Right-click image actions (#7) -------------------------------------
-// Copy / Open, like ComfyUI's image nodes. Loading an image is via drag-drop
-// onto the node or the Load Image button; clipboard paste was removed — it was
-// unreliable across browsers and clipboard-permission prompts.
+// Copy / Open, like ComfyUI's image nodes. Loading an image is also possible
+// via drag-drop onto the node, the Load Image button, or clipboard paste
+// (Ctrl+V / Cmd+V while the cursor hovers the Angelo canvas).
 
 function _angeloOpenImageInTab(node) {
     let url = null;
@@ -2410,6 +2482,8 @@ async function runDetect(node, conceptOverride) {
     if (!ref || !ref.filename) { showAngeloNotice(node, "Generate or load an image first, then Detect."); return; }
     const confEl = node._AngeloDetectConf && node._AngeloDetectConf._AngeloInput;
     const conf = confEl ? Math.max(0.05, Math.min(0.95, parseFloat(confEl.value) || 0.3)) : 0.3;
+    // Persist so it survives page reloads.
+    try { localStorage.setItem("angelo_detect_conf", String(conf)); } catch (e) { /* noop */ }
     hideAngeloNotice(node);   // clear any prior error before a new attempt
     // In-app overlay (NOT a toast) while the request is in flight — the
     // first detect builds the SAM 3 model and can take several seconds.
@@ -3126,12 +3200,15 @@ function triggerReset(node) {
     if (node._AngeloPlaceholder) node._AngeloPlaceholder.style.display = "flex";
     app.graph.setDirtyCanvas(true, true);
     if (typeof app.queuePrompt === "function") app.queuePrompt(0);
+    // Safety-net: if onExecuted never fires (e.g. server error), clear
+    // `reset` after 5 s so a stuck widget doesn't wipe the cache on the
+    // next unrelated Queue. onExecuted clears it immediately on success.
     setTimeout(() => {
         if (wr.value === true) {
             setWidget(wr, false);
             app.graph.setDirtyCanvas(true, true);
         }
-    }, 1000);
+    }, 5000);
 }
 
 
@@ -3694,10 +3771,12 @@ function setWidget(widget, value) {
     widget.value = value;
     // Some ComfyUI versions sync the value-for-serialization through the
     // widget's callback rather than reading widget.value directly. Fire
-    // it both with and without graph args to maximise compatibility.
+    // it with the owning node (widget.node may be unset on hidden widgets
+    // in some builds — fall back to null rather than crashing).
     try {
         if (typeof widget.callback === "function") {
-            widget.callback(value, app.canvas, widget.node || null);
+            const ownerNode = widget.node || null;
+            widget.callback(value, app.canvas, ownerNode);
         }
     } catch (e) {
         dbg("widget callback threw", widget.name, e);

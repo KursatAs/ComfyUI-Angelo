@@ -135,12 +135,11 @@ def _find_bpe(sam3_module):
 def _ensure_model():
     """Lazily build + cache the SAM3 image model and processor. Returns
     (model, processor) or raises RuntimeError with a clear message."""
-    if _STATE["import_error"]:
-        raise RuntimeError(_STATE["import_error"])
-    if _STATE["model"] is not None:
-        return _STATE["model"], _STATE["processor"]
-
+    # Read import_error inside the lock to avoid a race where one thread
+    # writes the error while another reads it outside the lock.
     with _LOCK:
+        if _STATE["import_error"]:
+            raise RuntimeError(_STATE["import_error"])
         if _STATE["model"] is not None:
             return _STATE["model"], _STATE["processor"]
         try:
@@ -400,3 +399,27 @@ if _HAS_SERVER:
             return web.json_response({"error": str(e)}, status=500)
 
         return web.json_response({"ok": True, **result})
+
+    @routes.post("/angelo/unload_sam3")
+    async def _angelo_unload_sam3(request):
+        """Release the in-memory SAM 3 model and free CPU RAM.
+        The next Detect call will reload it on demand."""
+        with _LOCK:
+            model = _STATE.get("model")
+            if model is None:
+                return web.json_response({"ok": True, "message": "SAM 3 was not loaded."})
+            try:
+                import torch
+                offload_device = _torch_devices()[1]
+                model.to(offload_device)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _STATE["model"] = None
+            _STATE["processor"] = None
+            _STATE["device"] = None
+            # Do NOT reset import_error — if the package was missing it's
+            # still missing after unload; a fresh load attempt will set it.
+        return web.json_response({"ok": True, "message": "SAM 3 unloaded successfully."})
+
