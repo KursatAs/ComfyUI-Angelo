@@ -676,6 +676,7 @@ def _refine_with_fine_upscaling(
         positive = node_helpers.conditioning_set_values(
             positive, {"reference_latents": [reference_latent]}, append=False,
         )
+        # Feather goes in the COMPOSITE, not the denoise mask — for Qwen/Wan.
         #
         # FLUX/Klein (4D, ~zero-mean latents): a soft mask works directly as
         # both the masked-zero and the noise_mask; their inpaint blend handles a
@@ -700,31 +701,6 @@ def _refine_with_fine_upscaling(
             latent_up = (1.0 - sample_mask.unsqueeze(0).unsqueeze(0)) * latent_up
         else:
             latent_up = (1.0 - sample_mask.unsqueeze(0)) * latent_up
-    else:
-        # Kursat Note:: this is experimental, yet NOT tested need confirmation!?
-        # ===== Refine mode (+ Smart Guided Inpaint) with Fine Upscale =====
-        # Problem: in a Klein 9B / edit-model workflow, the incoming `positive`
-        # conditioning already carries reference_latents = the FULL source image
-        # (set by an upstream ReferenceLatent node). When Fine Upscale crops a
-        # small region and passes that crop latent to the sampler, Klein's edit
-        # branch activates with the full-image reference. The model then tries to
-        # reproduce the WHOLE subject inside the tiny crop — producing the classic
-        # "entire subject drawn inside the masked area" artifact.
-        #
-        # Fix: replace any existing reference_latents with the crop's own latent
-        # (append=False, same treatment Smart Inpaint already gets). Klein still
-        # uses its edit branch, but the reference now matches the crop's scale
-        # and content, so it refines what is actually there instead of remapping
-        # the full scene into the crop canvas.
-        #
-        # Non-edit models (no reference_latents field) are unaffected —
-        # conditioning_set_values is a no-op for fields the model doesn't use.
-        # POSITIVE ONLY: putting reference_latents on negative would steer
-        # CFG>1 samplers AWAY from the crop reference, which is wrong.
-        reference_latent = latent_up.clone()
-        positive = node_helpers.conditioning_set_values(
-            positive, {"reference_latents": [reference_latent]}, append=False,
-        )
 
     # ----- Refine via noise-injection inpaint on the upscaled latent -----
     noise = comfy.sample.prepare_noise(latent_up, seed, None)
