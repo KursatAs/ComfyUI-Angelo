@@ -22,6 +22,7 @@ function dbg(...args) {
 // --- Module-level hover tracking for the keyboard shortcuts. Set by
 //     the canvas mouseenter / mouseleave handlers in attachPreviewCanvas.
 let _AngeloHoveredNode = null;
+const _AngeloPreviewNodeById = new Map();
 
 // --- Global queuePrompt hook: bumps click_seq on every AngeloRefine
 //     node where persistent_mask is on, so the standard ComfyUI Queue
@@ -229,12 +230,62 @@ function installKeyboardShortcuts() {
     dbg("installed keyboard shortcuts");
 }
 
+function installPreviewEventFence() {
+    if (app._AngeloPreviewEventFenceInstalled) return;
+
+    function nodeAtEvent(event) {
+        const hovered = _AngeloHoveredNode;
+        if (hovered && _eventInPreview(hovered, event)) return hovered;
+
+        const el = document.elementFromPoint(event.clientX, event.clientY);
+        const preview = el?.closest?.("[data-angelo-preview-node-id]");
+        if (preview) {
+            return _AngeloPreviewNodeById.get(preview.dataset.angeloPreviewNodeId) || null;
+        }
+
+        for (const node of _AngeloPreviewNodeById.values()) {
+            if (_eventInPreview(node, event)) return node;
+        }
+        return null;
+    }
+
+    const globalWheel = (event) => {
+        const node = nodeAtEvent(event);
+        if (!node?._AngeloHandlePreviewWheel) return;
+        node._AngeloHandlePreviewWheel(event);
+    };
+    window.addEventListener("wheel", globalWheel, { capture: true, passive: false });
+    document.addEventListener("wheel", globalWheel, { capture: true, passive: false });
+
+    const globalPointerDown = (event) => {
+        if (event.button !== 1) return;
+        const node = nodeAtEvent(event);
+        if (!node?._AngeloStartPreviewPan) return;
+        node._AngeloStartPreviewPan(event);
+    };
+    window.addEventListener("pointerdown", globalPointerDown, true);
+    document.addEventListener("pointerdown", globalPointerDown, true);
+
+    app._AngeloPreviewEventFenceInstalled = true;
+    dbg("installed global Angelo preview event fence");
+}
+
+function _eventInPreview(node, event) {
+    if (!node || event.clientX == null || event.clientY == null) return false;
+    const el = node._AngeloContainer || node._AngeloCanvasWrap || node._AngeloCanvas;
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return event.clientX >= r.left && event.clientX <= r.right
+        && event.clientY >= r.top && event.clientY <= r.bottom;
+}
+
 app.registerExtension({
     name: "Angelo.ClickToRefine",
 
     async setup() {
         installQueueHook();
         installKeyboardShortcuts();
+        installPreviewEventFence();
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
@@ -244,14 +295,25 @@ app.registerExtension({
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
-            hideMechanicalWidgets(this);
-            attachPreviewCanvas(this);
+            let attached = false;
+            try {
+                attached = attachPreviewCanvas(this);
+            } catch (e) {
+                console.error("[Angelo] failed to attach preview canvas", e);
+            }
+            if (attached) hideMechanicalWidgets(this);
             // Force LiteGraph to recompute layout now that hidden widgets
             // claim zero height — otherwise the node keeps its initial
             // tall size and the (now-hidden) widget slots show as gaps.
-            if (typeof this.setSize === "function" && this.computeSize) {
+            // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: do NOT gate on
+            // `typeof this.setSize === "function"`.  Nodes2/Vue nodes never
+            // expose setSize as a plain function, so the old guard silently
+            // skipped this block for every Nodes2 node.  setNodeSizeCompat
+            // already handles both renderers internally — only computeSize
+            // needs to be present so we can derive the minimum height.
+            if (this.computeSize) {
                 const min = this.computeSize();
-                if (this.size[1] < min[1]) this.size[1] = min[1];
+                if (this.size[1] < min[1]) setNodeSizeCompat(this, this.size[0], min[1]);
             }
             // Reflect persisted widget state in every toolbar control.
             // NOTE: on an existing-workflow load this runs BEFORE the
@@ -321,8 +383,11 @@ app.registerExtension({
                 seedCtrlW._AngeloPrevValue = seedCtrlW.value;
             }
             const min = [340, 680];
-            if (this.size[0] < min[0]) this.size[0] = min[0];
-            if (this.size[1] < min[1]) this.size[1] = min[1];
+            setNodeSizeCompat(
+                this,
+                Math.max(this.size[0], min[0]),
+                Math.max(this.size[1], min[1]),
+            );
         };
 
         // --- Right-click node menu: Open / Copy / Paste image (#7). Covers
@@ -417,7 +482,10 @@ app.registerExtension({
             // microtask-delayed sync sees the final restored state.
             const node = this;
             queueMicrotask(() => {
-                try { syncAllToolbarControls(node); }
+                try {
+                    if (node._AngeloWidget) hideMechanicalWidgets(node);
+                    syncAllToolbarControls(node);
+                }
                 catch (e) { dbg("onConfigure sync threw", e); }
             });
         };
@@ -430,7 +498,12 @@ app.registerExtension({
 // ============================================================
 
 function attachPreviewCanvas(node) {
-    if (node._AngeloWidget) return;  // already attached
+    if (node._AngeloWidget) return true;  // already attached
+    if (typeof node.addDOMWidget !== "function") {
+        console.warn("[Angelo] DOM widgets are not available in this ComfyUI node renderer; "
+            + "leaving native widgets visible as a fallback.");
+        return false;
+    }
 
     const container = document.createElement("div");
     container.style.width = "100%";
@@ -441,6 +514,35 @@ function attachPreviewCanvas(node) {
     container.style.overflow = "hidden";
     container.style.display = "flex";
     container.style.flexDirection = "column";
+    const previewNodeId = String(node.id ?? Math.random());
+    container.dataset.angeloPreviewNodeId = previewNodeId;
+    _AngeloPreviewNodeById.set(previewNodeId, node);
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: explicit minHeight on the outer
+    // container.  Classic LiteGraph calls getMinHeight() to pre-size the node
+    // and its DOM widget, so the container gets a height from the renderer.
+    // Nodes2/Vue does not make that call before first render, so the flex-column
+    // container collapses to 0 px, canvasWrap (flex:1 1 auto + minHeight:0)
+    // collapses with it, fitCanvasDisplaySize reads availH=0 and exits early,
+    // and the canvas never gets a CSS size — producing a tiny, non-interactive
+    // paint area.  A hard minHeight floor ensures both renderers work correctly.
+    container.style.minHeight = (_TOOLBAR_H_APPROX + _PREVIEW_MIN_CANVAS_H) + "px";
+
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 event fence.
+    // In Nodes2/Vue, pointer and wheel events that bubble past our container
+    // reach ComfyUI's graph-level handlers: wheel zooms the whole workspace,
+    // pointerdown/move trigger node-drag or graph-pan.  We stop ALL of them
+    // at the container boundary.  Child handlers (canvas, canvasWrap, toolbar
+    // buttons, inputs) fire FIRST in bubble order and handle the events they
+    // need; the fence only prevents escape to the parent graph layer.
+    // non-passive for wheel so preventDefault (called in canvasWrap handler)
+    // is not silently ignored if it reaches this level.
+    for (const evType of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+        container.addEventListener(evType, (e) => e.stopPropagation());
+    }
+    container.addEventListener("wheel", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+    }, { passive: false });
 
     // Toolbar above the canvas, top to bottom:
     //   modeRow     — Mode dropdown, centred (the master Sampler/Edit switch)
@@ -983,7 +1085,13 @@ function attachPreviewCanvas(node) {
     canvasWrap.style.position = "relative";
     canvasWrap.style.width = "100%";
     canvasWrap.style.flex = "1 1 auto";
-    canvasWrap.style.minHeight = "0";
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: minHeight must be a concrete
+    // value, not "0".  When the outer container has no pre-established height
+    // (Nodes2 path), "flex:1 1 auto + minHeight:0" collapses canvasWrap to
+    // 0 px — fitCanvasDisplaySize gets availH=0 and never sizes the canvas.
+    // _PREVIEW_MIN_CANVAS_H guarantees a physical floor in both renderers;
+    // the wrap can still grow beyond it when the node is made taller.
+    canvasWrap.style.minHeight = _PREVIEW_MIN_CANVAS_H + "px";
     canvasWrap.style.display = "flex";
     canvasWrap.style.alignItems = "center";
     canvasWrap.style.justifyContent = "center";
@@ -1118,11 +1226,23 @@ function attachPreviewCanvas(node) {
     // While zoomed/panned the auto-fit (fitCanvasDisplaySize) is suppressed
     // so it never stomps the manual view; reset / new image restore fit.
 
-    canvasWrap.addEventListener("wheel", (event) => {
-        if (!node._AngeloImg || !node._AngeloBaseW) return;
+    const handlePreviewWheel = (event) => {
+        // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: always stop the wheel event
+        // BEFORE any guard returns.  Previously preventDefault+stopPropagation
+        // were placed AFTER the `!_AngeloImg || !_AngeloBaseW` guard, so a
+        // scroll before the first image load (or while baseW was still 0) let
+        // the event bubble all the way up to ComfyUI's graph-level wheel
+        // handler, zooming the whole workspace instead of the preview canvas.
         event.preventDefault();
-        event.stopPropagation();   // don't also zoom the ComfyUI graph
-        const wrapW = canvasWrap.clientWidth, wrapH = canvasWrap.clientHeight;
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+        if (!node._AngeloImg || !node._AngeloBaseW) return;
+        // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: use _wrapDims() so wrapH is
+        // never 0.  With wrapH=0 the old code produced graphScaleY=Infinity,
+        // snapped cy to 0, and left the zoom anchor at the wrap's (non-existent)
+        // top edge — applyView then placed the canvas at top=-dispH/2, clipped
+        // by overflow:hidden, making zoom appear to do nothing.
+        const { w: wrapW, h: wrapH } = _wrapDims(node);
         const wrapRect = canvasWrap.getBoundingClientRect();
         // Convert cursor from viewport/visual pixels to layout pixels.
         // ComfyUI applies a CSS transform (scale) on the graph container;
@@ -1160,17 +1280,21 @@ function attachPreviewCanvas(node) {
         node._AngeloPanY = cy - ny * newH - (wrapH - newH) / 2;
         applyView(node);
         redrawCanvasWithOverlays(node);
-    }, { passive: false });
+    };
+    node._AngeloHandlePreviewWheel = handlePreviewWheel;
+    canvasWrap.addEventListener("wheel", handlePreviewWheel, { passive: false, capture: true });
+    canvas.addEventListener("wheel", handlePreviewWheel, { passive: false, capture: true });
 
     // Suppress the Windows middle-click autoscroll cursor.
     canvasWrap.addEventListener("mousedown", (event) => {
         if (event.button === 1) event.preventDefault();
     });
 
-    canvasWrap.addEventListener("pointerdown", (event) => {
+    const startAngeloPan = (event) => {
         if (event.button !== 1) return;   // middle button = pan / reset
         event.preventDefault();
         event.stopPropagation();   // don't let litegraph treat it as a node drag
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
         const now = performance.now();
         if (node._AngeloLastMiddleDown && (now - node._AngeloLastMiddleDown) < 350) {
             // Double middle-click → reset to fit.
@@ -1188,15 +1312,24 @@ function attachPreviewCanvas(node) {
             pointerId: event.pointerId,
         };
         if (node._AngeloCanvas) node._AngeloCanvas.style.cursor = "grabbing";
-    });
+    };
+    node._AngeloStartPreviewPan = startAngeloPan;
+    canvasWrap.addEventListener("pointerdown", startAngeloPan, { capture: true });
+    canvas.addEventListener("pointerdown", startAngeloPan, { capture: true });
 
-    canvasWrap.addEventListener("pointermove", (event) => {
+    function moveAngeloPan(event) {
         const p = node._AngeloPanning;
         if (!p) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
         node._AngeloPanX = p.startPanX + (event.clientX - p.startX);
         node._AngeloPanY = p.startPanY + (event.clientY - p.startY);
         applyView(node);
-    });
+    }
+    canvasWrap.addEventListener("pointermove", moveAngeloPan, { capture: true });
+    canvas.addEventListener("pointermove", moveAngeloPan, { capture: true });
+    window.addEventListener("pointermove", moveAngeloPan, true);
 
     function endAngeloPan() {
         const p = node._AngeloPanning;
@@ -1205,10 +1338,15 @@ function attachPreviewCanvas(node) {
         try { canvasWrap.releasePointerCapture(p.pointerId); } catch (e) { /* noop */ }
         redrawCanvasWithOverlays(node);   // restores the mode-appropriate cursor
     }
-    canvasWrap.addEventListener("pointerup", (event) => {
+    const handleAngeloPanUp = (event) => {
         if (event.button === 1) endAngeloPan();
-    });
-    canvasWrap.addEventListener("pointercancel", endAngeloPan);
+    };
+    canvasWrap.addEventListener("pointerup", handleAngeloPanUp, { capture: true });
+    canvas.addEventListener("pointerup", handleAngeloPanUp, { capture: true });
+    window.addEventListener("pointerup", handleAngeloPanUp, true);
+    canvasWrap.addEventListener("pointercancel", endAngeloPan, { capture: true });
+    canvas.addEventListener("pointercancel", endAngeloPan, { capture: true });
+    window.addEventListener("pointercancel", endAngeloPan, true);
 
     // --- Right-click menu + drag-drop image loading (#7) ---
     // Right-click the preview → Open / Copy / Paste. The preview is a DOM
@@ -1349,9 +1487,31 @@ function attachPreviewCanvas(node) {
     canvas.addEventListener("pointerenter", () => {
         _AngeloHoveredNode = node;
     });
+    for (const hoverEl of [container, canvasWrap]) {
+        hoverEl.addEventListener("pointerenter", () => {
+            _AngeloHoveredNode = node;
+        });
+        hoverEl.addEventListener("pointerleave", (event) => {
+            const related = event.relatedTarget;
+            if (related && hoverEl.contains(related)) return;
+            if (_AngeloHoveredNode === node && !_eventInPreview(node, event)) {
+                _AngeloHoveredNode = null;
+            }
+        });
+    }
 
     canvas.addEventListener("pointerdown", (event) => {
         if (event.button !== 0) return;
+        // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: always stop propagation on
+        // left-button pointerdown.  Every early-return path in this handler
+        // (detection mode, Smart Guided mode, normal refine mode, no paint
+        // mode) was returning without calling stopPropagation, so the event
+        // bubbled up to Nodes2's Vue node-drag handler.  The user pressing the
+        // left mouse button anywhere on the canvas then dragging moved the
+        // entire node — or, if the node was on the background, panned the
+        // whole ComfyUI workspace.  stopPropagation here is safe: the `click`
+        // event that triggers the refine fires independently and is unaffected.
+        event.stopPropagation();
         // Detection select mode owns the canvas — let the click confirm a
         // candidate; don't start a paint stroke or rectangle drag. EXCEPT a
         // Shift/Alt drag, which is the touch-up brush (Refine only): Shift
@@ -1533,6 +1693,11 @@ function attachPreviewCanvas(node) {
             return _TOOLBAR_H_APPROX + canvasH;
         },
     });
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: mutate options.hidden in place
+    // (same reason as hideMechanicalWidgets — preserves Vue reactive proxy).
+    if (!widget.options) widget.options = {};
+    widget.options.hidden = false;
+    moveWidgetToFront(node, widget);
 
     // Make the preview widget fill the node's full width.
     //
@@ -1574,12 +1739,17 @@ function attachPreviewCanvas(node) {
         const onRemoved = node.onRemoved;
         node.onRemoved = function () {
             try { ro.disconnect(); } catch (e) { /* noop */ }
+            try { _AngeloPreviewNodeById.delete(previewNodeId); } catch (e) { /* noop */ }
+            try { window.removeEventListener("pointermove", moveAngeloPan, true); } catch (e) { /* noop */ }
+            try { window.removeEventListener("pointerup", handleAngeloPanUp, true); } catch (e) { /* noop */ }
+            try { window.removeEventListener("pointercancel", endAngeloPan, true); } catch (e) { /* noop */ }
             if (onRemoved) onRemoved.apply(this, arguments);
         };
     }
     fitCanvasDisplaySize(node);
 
     dbg("attached preview canvas to node", node.id);
+    return true;
 }
 
 function _angeloIsZoomed(node) {
@@ -1605,6 +1775,36 @@ const _PREVIEW_MAX_H       = 560;
 const _PREVIEW_MIN_CANVAS_H = 260;
 const _TOOLBAR_H_APPROX    = 190;
 
+// ── Nodes2-safe wrap dimensions ─────────────────────────────────────────
+// Kursat NOTE!!! 2026-06-10 — Nodes2 fix: single helper for canvasWrap dims.
+// In Nodes2/Vue the DOM widget container is not pre-sized by the framework
+// before first render, so wrap.clientHeight is 0 even after our minHeight
+// CSS floor.  Reading clientHeight = 0 in applyView positions the canvas at
+// top = (0 - dispH) / 2 = −dispH/2, entirely above the wrap's top edge;
+// canvasWrap's overflow:hidden then clips the whole canvas → invisible,
+// unresponsive paint area.  The same zero propagates into the wheel-zoom
+// anchor calculation and updateMinimap, breaking both.
+//
+// _wrapDims() derives the height from getMinHeight() when clientHeight <= 0,
+// matching the height that classic LiteGraph would have allocated.  Every
+// function that needs the wrap size uses this instead of raw clientWidth/Height.
+// ────────────────────────────────────────────────────────────────────────
+function _wrapDims(node) {
+    const wrap = node._AngeloCanvasWrap;
+    if (!wrap) return { w: 0, h: 0 };
+    const w = wrap.clientWidth;
+    let h = wrap.clientHeight;
+    if (h <= 0) {
+        // Nodes2 path: derive canvas-area height from the widget's reported
+        // minimum height (toolbar + canvas) minus the toolbar contribution.
+        const totalH = (node._AngeloWidget && typeof node._AngeloWidget.getMinHeight === "function")
+            ? node._AngeloWidget.getMinHeight()
+            : (_TOOLBAR_H_APPROX + _PREVIEW_MIN_CANVAS_H);
+        h = Math.max(_PREVIEW_MIN_CANVAS_H, totalH - _TOOLBAR_H_APPROX);
+    }
+    return { w, h };
+}
+
 // Compute the BASE (fit) display size: the canvas size at zoom=1, fitting
 // the wrap while preserving aspect ratio. Stored as _AngeloBaseW/H; the
 // live size is base × zoom, applied by applyView().
@@ -1621,8 +1821,7 @@ function fitCanvasDisplaySize(node) {
     const canvas = node._AngeloCanvas;
     const wrap = node._AngeloCanvasWrap;
     if (!canvas || !wrap) return;
-    const availW = wrap.clientWidth;
-    const availH = wrap.clientHeight;
+    const { w: availW, h: availH } = _wrapDims(node);
     if (availW <= 0 || availH <= 0) return;
     const img = node._AngeloImg;
     const natW = (img && img.naturalWidth) ? img.naturalWidth : canvas.width;
@@ -1649,13 +1848,15 @@ function applyView(node) {
     if (!baseW || !baseH) return;
     const z = node._AngeloZoom || 1;
     const dispW = baseW * z, dispH = baseH * z;
-    const wrapW = wrap.clientWidth, wrapH = wrap.clientHeight;
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: use _wrapDims() instead of raw
+    // clientWidth/clientHeight.  See _wrapDims() comment for the full story.
+    const { w: wrapW, h: wrapH } = _wrapDims(node);
     const left = (wrapW - dispW) / 2 + (node._AngeloPanX || 0);
-    const top = (wrapH - dispH) / 2 + (node._AngeloPanY || 0);
-    canvas.style.width = dispW + "px";
+    const top  = (wrapH - dispH) / 2 + (node._AngeloPanY || 0);
+    canvas.style.width  = dispW + "px";
     canvas.style.height = dispH + "px";
-    canvas.style.left = left + "px";
-    canvas.style.top = top + "px";
+    canvas.style.left   = left  + "px";
+    canvas.style.top    = top   + "px";
     updateMinimap(node);
 }
 
@@ -1700,9 +1901,10 @@ function updateMinimap(node) {
     // currently lands inside the wrap viewport.
     const baseW = node._AngeloBaseW, baseH = node._AngeloBaseH;
     const dispW = baseW * z, dispH = baseH * z;
-    const wrapW = wrap.clientWidth, wrapH = wrap.clientHeight;
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: use _wrapDims() (same reason as applyView).
+    const { w: wrapW, h: wrapH } = _wrapDims(node);
     const left = (wrapW - dispW) / 2 + (node._AngeloPanX || 0);
-    const top = (wrapH - dispH) / 2 + (node._AngeloPanY || 0);
+    const top  = (wrapH - dispH) / 2 + (node._AngeloPanY || 0);
     const vx0 = Math.max(0, Math.min(1, (0 - left) / dispW));
     const vy0 = Math.max(0, Math.min(1, (0 - top) / dispH));
     const vx1 = Math.max(0, Math.min(1, (wrapW - left) / dispW));
@@ -2023,7 +2225,7 @@ function syncAreaPromptVisibility(node) {
 
 function loadIntoCanvas(node, url) {
     if (!node._AngeloCanvas) {
-        attachPreviewCanvas(node);
+        if (!attachPreviewCanvas(node)) return;
     }
     const canvas = node._AngeloCanvas;
     const placeholder = node._AngeloPlaceholder;
@@ -2077,7 +2279,7 @@ function loadIntoCanvas(node, url) {
             const idealNodeH = _TOOLBAR_H_APPROX + canvasH + 40;
             const newH = Math.max(480, Math.min(960, idealNodeH));
             if (!node.size) node.size = [nodeW, newH];
-            else if (Math.abs(node.size[1] - newH) > 30) node.size[1] = newH;
+            else if (Math.abs(node.size[1] - newH) > 30) setNodeSizeCompat(node, node.size[0], newH);
         }
 
         // If we're in detect mode (candidates persist for batch editing),
@@ -3825,6 +4027,36 @@ function setWidget(widget, value) {
     }
 }
 
+function setNodeSizeCompat(node, width, height) {
+    if (!node) return;
+    const nextW = Math.max(1, Number(width) || 1);
+    const nextH = Math.max(1, Number(height) || 1);
+    if (typeof node.setSize === "function") {
+        node.setSize([nextW, nextH]);
+    } else {
+        // Nodes2/Vue-backed nodes sync size changes via the property setter.
+        // Mutating node.size[0]/[1] in place can leave the layout store stale.
+        node.size = [nextW, nextH];
+    }
+    if (node.graph && node.graph.setDirtyCanvas) {
+        node.graph.setDirtyCanvas(true, true);
+    }
+}
+
+function moveWidgetToFront(node, widget) {
+    if (!node?.widgets || !widget) return;
+    const idx = node.widgets.indexOf(widget);
+    if (idx <= 0) return;
+    // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: mutate the widgets array IN PLACE
+    // instead of replacing it with a new array.  Nodes2/Vue holds node.widgets
+    // as a reactive proxy; assigning `node.widgets = newArray` swaps out the
+    // reactive reference, so Vue components watching the old array stop receiving
+    // updates.  splice + unshift mutate the same array object and trigger Vue's
+    // reactive tracking correctly on both classic LiteGraph and Nodes2.
+    node.widgets.splice(idx, 1);
+    node.widgets.unshift(widget);
+}
+
 function hideMechanicalWidgets(node) {
     // JS-driven widgets that don't need to clutter the user-visible UI.
     // Skipped while Angelo_DEBUG is on so we can watch them update.
@@ -3876,6 +4108,17 @@ function hideMechanicalWidgets(node) {
         const isAutoControl = typeof w.name === "string"
             && /control_after_generate/i.test(w.name);
         if (!hideNames.includes(w.name) && !isAutoControl) continue;
+        // Nodes2/Vue widgets use widget.options.hidden to decide whether a
+        // widget row is rendered. Classic LiteGraph mostly ignores that and
+        // relies on the type/computeSize/draw changes below, so set both.
+        // Kursat NOTE!!! 2026-06-10 — Nodes2 fix: mutate options.hidden in
+        // place instead of replacing the whole options object with a spread.
+        // Spreading creates a new plain object, which drops Vue's deep-reactive
+        // proxy on the original options — Nodes2 components watching
+        // options.hidden would lose their reactive dependency.  Direct property
+        // assignment on the existing object preserves the proxy correctly.
+        if (!w.options) w.options = {};
+        w.options.hidden = true;
         // The "type = hidden" trick alone isn't enough — some renderers
         // still reserve the widget's natural height. Belt + suspenders:
         // use ComfyUI's own "converted-widget" type (which the frontend
@@ -3887,6 +4130,9 @@ function hideMechanicalWidgets(node) {
         w.hidden = true;
         w.computeSize = () => [0, -4];
         w.draw = () => {};
+    }
+    if (node.graph && node.graph.setDirtyCanvas) {
+        node.graph.setDirtyCanvas(true, true);
     }
 }
 
