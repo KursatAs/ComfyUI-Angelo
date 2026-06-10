@@ -63,6 +63,14 @@ import nodes as comfy_nodes
 #     "source_pixels": Tensor|None,# decoded source base (lazy, cached)
 #     "fingerprint": str,          # hash of incoming latent; mismatch = upstream changed
 #     "last_mask": Tensor|None,    # most recent [1,H,W] refine mask, for the MASK output
+#     # Kursat NOTE!!! 2026-06-10: gen_token is a monotonically-increasing counter
+#     # stamped under the per-node lock in Step 1 of every edit run.  Step 3
+#     # compares its local copy against state["gen_token"] before writing to
+#     # history; if a newer run incremented the token in the meantime the stale
+#     # result is discarded and history is left in the state the newer run wrote.
+#     # This prevents an older slow GPU sample from overwriting a newer result
+#     # when two queue items overlap on the same node (Risk 1 fix).
+#     "gen_token": int,            # monotonic edit counter — guards out-of-order history writes
 #   }
 _STATE: dict[str, dict] = {}
 
@@ -1024,15 +1032,26 @@ class AngeloRefine:
                 # drives them. SAMPLING IS STILL UNCHANGED — neither value
                 # is read by any code path below the print. Step 3 wires
                 # the actual crop+upscale+refine.
+                # Kursat NOTE!!! 2026-06-10 — Misleading tooltip fix: tooltip previously said
+                # "bilinear-upscaled in latent space" which was wrong.  The actual
+                # path crops the painted region in PIXEL space, upscales it with
+                # the chosen PIL filter (lanczos by default), VAE-encodes the
+                # result, refines, then composites back — deliberately avoiding
+                # latent-space interpolation which smears low-frequency artefacts
+                # the model cannot recover from (see _refine_with_fine_upscaling
+                # docstring).  Tooltip updated to match reality.
                 "fine_upscaling": ("BOOLEAN", {"default": False,
                                                "tooltip": "When ON, the painted region is cropped, "
-                                                          "bilinear-upscaled in latent space to hit "
-                                                          "min_megapixels, refined, downscaled, and "
+                                                          "upscaled in PIXEL space (using the chosen "
+                                                          "resize method) to hit min_megapixels, "
+                                                          "VAE-encoded, refined, downscaled, and "
                                                           "composited back. Gives the model more "
                                                           "effective resolution on small painted "
-                                                          "regions. Upscale capped at 8× linear "
-                                                          "internally. Set via the Fine Upscale "
-                                                          "toggle above the preview."}),
+                                                          "regions without the low-frequency smearing "
+                                                          "of latent-space interpolation. Upscale "
+                                                          "capped at max_upscale× linear internally. "
+                                                          "Set via the Fine Upscale toggle above the "
+                                                          "preview."}),
                 "min_megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1,
                                              "tooltip": "Target megapixels for the refine pass when "
                                                         "Fine Upscaling is on. Only used in that mode. "
@@ -1126,6 +1145,14 @@ class AngeloRefine:
                 # entry as the active mask.
                 "rect_points": ("STRING", {"default": "", "multiline": False}),
 
+                # Kursat NOTE!!! 2026-06-10 — Misleading tooltip fix: tooltip previously said
+                # "if area text is empty, the main positive is used" which is
+                # WRONG when CLIP is connected.  The code intentionally encodes
+                # the empty string (→ empty conditioning) to prevent whole-image
+                # reference_latents in the main positive from leaking into the
+                # inpaint region (see area-conditioning block in run()).  The main
+                # positive is only used when CLIP is NOT connected.  Tooltip
+                # updated to describe the actual behaviour.
                 "area_prompt": ("BOOLEAN", {"default": False,
                                             "tooltip": "When ON, refinements encode the Area Prompt text "
                                                        "(typed in the box below the canvas) with the "
@@ -1134,9 +1161,13 @@ class AngeloRefine:
                                                        "with a different prompt (e.g. main prompt = wide "
                                                        "shot, area prompt = \"detailed face, photorealistic "
                                                        "eyes\"). The click-and-mask behaviour is unchanged; "
-                                                       "only the prompt differs. If CLIP isn't connected or "
-                                                       "the area text is empty, the main positive/negative "
-                                                       "are used. Forced ON in Smart Inpaint."}),
+                                                       "only the prompt differs. If CLIP isn't connected, "
+                                                       "the main positive/negative are used as a fallback. "
+                                                       "NOTE: when CLIP IS connected, an empty area text "
+                                                       "encodes as empty conditioning (not the main positive) "
+                                                       "— this is intentional to block whole-image reference "
+                                                       "latents from leaking into the inpaint region. "
+                                                       "Forced ON in Smart Inpaint."}),
 
                 # Hidden — DOM text box below the canvas drives these.
                 # The Area Prompt input has a Pos/Neg toggle that decides
@@ -1412,6 +1443,11 @@ class AngeloRefine:
                     # source_image output survives _HISTORY_CAP eviction of history[0].
                     "source_latent": new_latent,
                     "source_pixels": None,
+                    # Kursat NOTE!!! 2026-06-10: Generation token — starts at 0 on
+                    # every fresh session; incremented under the per-node lock in
+                    # Step 1 of each edit run so Step 3 can detect stale writes
+                    # (see Risk 1 fix).
+                    "gen_token": 0,
                 }
             out_latent = {"samples": new_latent}
             ui_msg = {
@@ -1485,6 +1521,10 @@ class AngeloRefine:
                     # history[0] (which mutates under _HISTORY_CAP eviction).
                     "source_latent": incoming.clone(),
                     "source_pixels": None,
+                    # Kursat NOTE!!! 2026-06-10: Generation token reset alongside
+                    # every explicit state reset so the counter stays consistent
+                    # with the new session (see Risk 1 fix).
+                    "gen_token": 0,
                 }
             state = _STATE[node_id]
 
@@ -1504,6 +1544,13 @@ class AngeloRefine:
         reroll_now = False
         current = None
         current_pixels = None
+        # Kursat NOTE!!! 2026-06-10: Local copies of the per-run generation token
+        # and the backend-saved last mask, both read under the lock in Step 1 and
+        # used in Step 2/3 outside it.  Initialised to safe defaults so Step 3
+        # comparisons work even on code paths that never enter the lock (e.g. a
+        # very early return).
+        _my_gen_token = -1        # will be overwritten inside the lock below
+        _persistent_last_mask = None  # captured only when persistent_mask=True
 
         with node_lock:
             state = _STATE.get(node_id)
@@ -1579,6 +1626,23 @@ class AngeloRefine:
                     and click_seq != state["click_seq"]
             )
 
+            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix: generation token.
+            # Increment under the lock so every overlapping run gets a unique
+            # monotonic token.  Step 3 refuses to write history if a newer run
+            # has already incremented past _my_gen_token, preventing an older
+            # slow GPU sample from appending its stale output after the newer
+            # result has already been committed.
+            state["gen_token"] = state.get("gen_token", 0) + 1
+            _my_gen_token = state["gen_token"]
+
+            # Kursat NOTE!!! 2026-06-10 — Risk 3 fix: backend persistent-mask
+            # capture.  Snapshot state["last_mask"] under the lock so the mask-
+            # building code in Step 2 can fall back to it when persistent_mask
+            # is ON and all widget mask sources (stroke_points, seg_polygon,
+            # seg_mask_png) are empty — guards against JS clearing those values
+            # between queue presses.
+            _persistent_last_mask = state.get("last_mask") if persistent_mask else None
+
         # --- Step 2: GPU sampling outside the lock ---
         # Source latent for every edit is the current cached latent, so all
         # paths build ON TOP of the previous result:
@@ -1644,14 +1708,16 @@ class AngeloRefine:
                         scale_x, scale_y, current.device,
                     )
                 else:
-                    # No rectangle drawn yet — nothing to do. Caller
-                    # already gates on click_seq change so this is the
-                    # "user switched into Smart Inpaint without dragging
-                    # a rect" case; fall through with an empty mask and
-                    # let downstream noise_mask handling preserve the
-                    # cached latent.
-                    mask = torch.zeros((1, latent_h, latent_w),
-                                       device=current.device, dtype=torch.float32)
+                    # Kursat NOTE!!! 2026-06-10 — Risk 2 fix: no rectangle drawn yet.
+                    # Previously this built a torch.zeros mask and let execution fall
+                    # through.  _refine_with_fine_upscaling detected bbox=None and
+                    # returned (current, current_pixels) unchanged, but the caller
+                    # still saw _refined is not None and appended that unchanged
+                    # latent to history as a phantom no-op edit — corrupting
+                    # Undo/Redo with entries that contain no visible change.
+                    # Setting mask=None is the sentinel that the guard below
+                    # uses to skip sampling AND the history append entirely.
+                    mask = None
             else:
                 # Refine mask sources, in priority:
                 #   1. a brushed touch-up raster mask (Detect Shift/Alt brush)
@@ -1676,6 +1742,25 @@ class AngeloRefine:
                         stroke_pts, r_latent,
                         scale_x, scale_y, current.device,
                     )
+                elif _persistent_last_mask is not None:
+                    # Kursat NOTE!!! 2026-06-10 — Risk 3 fix: backend persistent-mask
+                    # reuse.  All widget mask sources (raster, seg, stroke) are empty
+                    # AND persistent_mask is ON, so we fall back to the last confirmed
+                    # backend mask instead of a click circle.  This guards against JS
+                    # clearing stroke_points / seg_polygon / seg_mask_png between
+                    # queue presses, which would otherwise silently replace the
+                    # intended persistent mask with a tiny circle at the last click
+                    # coordinates.  Clone to avoid aliasing state["last_mask"] during
+                    # feathering.  Resize when the latent dimensions changed (e.g.
+                    # after a Load Image that picked a different resolution).
+                    mask = _persistent_last_mask.clone()
+                    if mask.shape[-2] != latent_h or mask.shape[-1] != latent_w:
+                        mask = torch.nn.functional.interpolate(
+                            mask.unsqueeze(0),
+                            size=(latent_h, latent_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0).clamp(0.0, 1.0)
                 else:
                     cx_latent = click_x * scale_x
                     cy_latent = click_y * scale_y
@@ -1684,139 +1769,169 @@ class AngeloRefine:
                         cx_latent, cy_latent, r_latent,
                         current.device,
                     )
-            if sigma_latent > 0:
-                mask = _gaussian_blur_2d(mask, max(0.5, sigma_latent))
-                mask = mask.clamp(0.0, 1.0)
+            # Kursat NOTE!!! 2026-06-10 — Risk 2 fix: mask=None guard.
+            # Smart Inpaint with no rectangle sets mask=None above.  Skipping
+            # the block below keeps _refined=None and _this_mask=None so Step 3
+            # performs no history append and no click_seq advance — the run is
+            # treated as a pure no-op and Undo/Redo are not polluted.
+            if mask is not None:
+                if sigma_latent > 0:
+                    mask = _gaussian_blur_2d(mask, max(0.5, sigma_latent))
+                    mask = mask.clamp(0.0, 1.0)
 
-            _this_mask = mask  # capture for state write + MASK output
+                _this_mask = mask  # capture for state write + MASK output
 
-            # Area-prompt conditioning selection. When area_prompt is on AND a
-            # CLIP is connected, the refine uses the AREA text ONLY and NEVER
-            # the main prompt — even when the Area text is empty, in which case
-            # we encode the empty string (→ an empty conditioning) rather than
-            # falling back to `positive`. This is load-bearing for the edit
-            # modes: the main positive can carry whole-image reference_latents
-            # (a Klein edit workflow's ReferenceLatent), and letting it leak in
-            # made an empty-Area-Prompt Smart Inpaint reproduce the whole scene.
-            # Negative area text is optional — falls back to the main negative
-            # when empty (fine for CFG=1 / distilled models that ignore it).
-            #
-            # Smart Guided Inpaint prepends a location prefix to the positive
-            # text (e.g. "In the top left of the image, ") so the edit model
-            # places the content at the chosen spot.
-            #
-            # Without a CLIP we can't encode anything, so we must use the
-            # already-encoded main conditioning (an unavoidable degenerate case
-            # — area prompts need a CLIP connected).
-            area_pos_text = str(area_text_positive)
-            if inpainting_mode == "Smart Guided Inpaint":
-                prefix = _GUIDED_LOCATION_PREFIXES.get(str(guided_location), "")
-                area_pos_text = prefix + area_pos_text
-            if area_prompt and clip is not None:
-                tokens_p = clip.tokenize(area_pos_text)
-                refine_positive = clip.encode_from_tokens_scheduled(tokens_p)
-                if str(area_text_negative).strip():
-                    tokens_n = clip.tokenize(str(area_text_negative))
-                    refine_negative = clip.encode_from_tokens_scheduled(tokens_n)
+                # Area-prompt conditioning selection. When area_prompt is on AND a
+                # CLIP is connected, the refine uses the AREA text ONLY and NEVER
+                # the main prompt — even when the Area text is empty, in which case
+                # we encode the empty string (→ an empty conditioning) rather than
+                # falling back to `positive`. This is load-bearing for the edit
+                # modes: the main positive can carry whole-image reference_latents
+                # (a Klein edit workflow's ReferenceLatent), and letting it leak in
+                # made an empty-Area-Prompt Smart Inpaint reproduce the whole scene.
+                # Negative area text is optional — falls back to the main negative
+                # when empty (fine for CFG=1 / distilled models that ignore it).
+                #
+                # Smart Guided Inpaint prepends a location prefix to the positive
+                # text (e.g. "In the top left of the image, ") so the edit model
+                # places the content at the chosen spot.
+                #
+                # Without a CLIP we can't encode anything, so we must use the
+                # already-encoded main conditioning (an unavoidable degenerate case
+                # — area prompts need a CLIP connected).
+                area_pos_text = str(area_text_positive)
+                if inpainting_mode == "Smart Guided Inpaint":
+                    prefix = _GUIDED_LOCATION_PREFIXES.get(str(guided_location), "")
+                    area_pos_text = prefix + area_pos_text
+                if area_prompt and clip is not None:
+                    tokens_p = clip.tokenize(area_pos_text)
+                    refine_positive = clip.encode_from_tokens_scheduled(tokens_p)
+                    if str(area_text_negative).strip():
+                        tokens_n = clip.tokenize(str(area_text_negative))
+                        refine_negative = clip.encode_from_tokens_scheduled(tokens_n)
+                    else:
+                        refine_negative = negative
                 else:
+                    refine_positive = positive
                     refine_negative = negative
-            else:
-                refine_positive = positive
-                refine_negative = negative
 
-            # Sample with the mask. Use the seed widget value as-is —
-            # NO click_seq offset. Per-Queue variation (when persistent_mask
-            # is on) and per-click variation (when user wants different
-            # attempts on the same spot) are now controlled by seed_control:
-            #   fixed     → same seed each run, repeatable result
-            #   randomize → seed changes after each run (via JS after-gen),
-            #               so each Queue / click produces a different result
-            #   increment/decrement → +1/-1 each run
-            # An older version of this code did `(seed + click_seq) & mask`
-            # to fake per-click variation in the absence of after-gen
-            # control. That broke "fixed means fixed" — even with the seed
-            # widget locked, click_seq's increment still moved the effective
-            # sampling seed. Now the user has explicit control.
-            this_seed = int(seed)
-            # Derive the actual step count from the sigmas + denoise so the
-            # progress bar matches reality. The sampler runs
-            # len(refine_sigmas)-1 steps, where refine_sigmas is the truncated
-            # schedule. Using the `steps` widget here was wrong: it only
-            # controls the progress bar, not the actual step count, so a
-            # mismatch produced a jumpy / incorrect progress display.
-            _refine_steps = max(1, round((len(sigmas) - 1) * denoise))
-            callback = latent_preview.prepare_callback(guider.model_patcher, _refine_steps)
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+                # Sample with the mask. Use the seed widget value as-is —
+                # NO click_seq offset. Per-Queue variation (when persistent_mask
+                # is on) and per-click variation (when user wants different
+                # attempts on the same spot) are now controlled by seed_control:
+                #   fixed     → same seed each run, repeatable result
+                #   randomize → seed changes after each run (via JS after-gen),
+                #               so each Queue / click produces a different result
+                #   increment/decrement → +1/-1 each run
+                # An older version of this code did `(seed + click_seq) & mask`
+                # to fake per-click variation in the absence of after-gen
+                # control. That broke "fixed means fixed" — even with the seed
+                # widget locked, click_seq's increment still moved the effective
+                # sampling seed. Now the user has explicit control.
+                this_seed = int(seed)
+                # Derive the actual step count from the sigmas + denoise so the
+                # progress bar matches reality. The sampler runs
+                # len(refine_sigmas)-1 steps, where refine_sigmas is the truncated
+                # schedule. Using the `steps` widget here was wrong: it only
+                # controls the progress bar, not the actual step count, so a
+                # mismatch produced a jumpy / incorrect progress display.
+                _refine_steps = max(1, round((len(sigmas) - 1) * denoise))
+                callback = latent_preview.prepare_callback(guider.model_patcher, _refine_steps)
+                disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-            # Source latent = the current cached latent for every path (see
-            # the note above). Re-roll already exposed the pre-edit base as
-            # `current` via its pop, so it needs no special-casing here.
-            refine_source = current
+                # Source latent = the current cached latent for every path (see
+                # the note above). Re-roll already exposed the pre-edit base as
+                # `current` via its pop, so it needs no special-casing here.
+                refine_source = current
 
-            # ===== Inpainting Mode pre-processing =====
-            # Refine: no pre-processing — partial denoise from the
-            #   existing latent does the work.
-            # Smart Inpaint: forces fine_upscaling=True up top, so its
-            #   pre-processing (latent zero + reference_latents) lives
-            #   inside _refine_with_fine_upscaling.
-            # Smart Guided Inpaint: whole-image edit through the non-
-            #   fine-upscale path below — inject the scene as
-            #   reference_latents so Klein's edit branch keeps the rest
-            #   of the image faithful while applying the location-guided
-            #   change. POSITIVE ONLY (negative reference would steer
-            #   CFG>1 samplers away from the scene).
-            if inpainting_mode == "Smart Guided Inpaint":
-                reference_latent = refine_source.clone()
-                refine_positive = node_helpers.conditioning_set_values(
-                    refine_positive, {"reference_latents": [reference_latent]}, append=True,
-                )
+                # ===== Inpainting Mode pre-processing =====
+                # Refine: no pre-processing — partial denoise from the
+                #   existing latent does the work.
+                # Smart Inpaint: forces fine_upscaling=True up top, so its
+                #   pre-processing (latent zero + reference_latents) lives
+                #   inside _refine_with_fine_upscaling.
+                # Smart Guided Inpaint: whole-image edit through the non-
+                #   fine-upscale path below — inject the scene as
+                #   reference_latents so Klein's edit branch keeps the rest
+                #   of the image faithful while applying the location-guided
+                #   change. POSITIVE ONLY (negative reference would steer
+                #   CFG>1 samplers away from the scene).
+                if inpainting_mode == "Smart Guided Inpaint":
+                    reference_latent = refine_source.clone()
+                    refine_positive = node_helpers.conditioning_set_values(
+                        refine_positive, {"reference_latents": [reference_latent]}, append=True,
+                    )
 
-            if fine_upscaling:
-                _refined, _refined_pixels = _refine_with_fine_upscaling(
-                    guider=guider, sampler=sampler, sigmas=sigmas,
-                    vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
-                    scale_x=scale_x, scale_y=scale_y,
-                    target_mp=float(min_megapixels),
-                    max_linear=float(max_upscale),
-                    resize_method=str(resize_method),
-                    context_pad_pixel=int(fine_context_pad),
-                    inpainting_mode=str(inpainting_mode),
-                    seed=this_seed,
-                    positive=refine_positive, negative=refine_negative,
-                    denoise=denoise, callback=callback, disable_pbar=disable_pbar,
-                )
-            else:
-                noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
-                refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
-                temp_g = _guider_with_conds(guider, refine_positive, refine_negative)
-                _refined = _guider_sample(
-                    temp_g, noise, refine_source, sampler, refine_sigmas,
-                    denoise_mask=mask,
-                    callback=callback,
-                    disable_pbar=disable_pbar,
-                    seed=this_seed,
-                )
-                # _guider_sample already moves the result to intermediate_device().
-                _refined_pixels = None
+                if fine_upscaling:
+                    _refined, _refined_pixels = _refine_with_fine_upscaling(
+                        guider=guider, sampler=sampler, sigmas=sigmas,
+                        vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
+                        scale_x=scale_x, scale_y=scale_y,
+                        target_mp=float(min_megapixels),
+                        max_linear=float(max_upscale),
+                        resize_method=str(resize_method),
+                        context_pad_pixel=int(fine_context_pad),
+                        inpainting_mode=str(inpainting_mode),
+                        seed=this_seed,
+                        positive=refine_positive, negative=refine_negative,
+                        denoise=denoise, callback=callback, disable_pbar=disable_pbar,
+                    )
+                else:
+                    noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
+                    refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
+                    temp_g = _guider_with_conds(guider, refine_positive, refine_negative)
+                    _refined = _guider_sample(
+                        temp_g, noise, refine_source, sampler, refine_sigmas,
+                        denoise_mask=mask,
+                        callback=callback,
+                        disable_pbar=disable_pbar,
+                        seed=this_seed,
+                    )
+                    # _guider_sample already moves the result to intermediate_device().
+                    _refined_pixels = None
 
         # --- Step 3: write results back to state under per-node lock ---
         with node_lock:
             state = _STATE.get(node_id)
+            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix: generation token guard.
+            # If a newer concurrent run incremented state["gen_token"] past
+            # _my_gen_token while this run was on the GPU, that newer run has
+            # already written its (more up-to-date) result to history.  Appending
+            # THIS run's stale output on top would corrupt the undo stack by
+            # burying the newer result one Undo step back.  Skipping the history
+            # write here leaves the newer run's commit intact.  The local
+            # `current` / output-socket values are still updated so the ComfyUI
+            # pipeline gets this run's tensors — only the persistent history state
+            # is protected.
+            _is_current_gen = (state.get("gen_token") == _my_gen_token)
             if _refined is not None:
-                state["history"].append((_refined, _refined_pixels))
-                if len(state["history"]) > _HISTORY_CAP:
-                    state["history"] = state["history"][-_HISTORY_CAP:]
-                # A genuine new edit (click or re-roll) invalidates the redo branch.
-                state["redo_stack"] = []
-                state["click_seq"] = click_seq
-                state["refine_seed_at_run"] = int(seed)
-                state["last_mask"] = _this_mask
+                if _is_current_gen:
+                    state["history"].append((_refined, _refined_pixels))
+                    if len(state["history"]) > _HISTORY_CAP:
+                        state["history"] = state["history"][-_HISTORY_CAP:]
+                    # A genuine new edit (click or re-roll) invalidates the redo branch.
+                    state["redo_stack"] = []
+                    state["click_seq"] = click_seq
+                    state["refine_seed_at_run"] = int(seed)
+                    state["last_mask"] = _this_mask
+                # Always update local variables for this run's output socket,
+                # even when the history write was skipped for a stale-gen run.
                 current = _refined
                 current_pixels = _refined_pixels
             elif _this_mask is not None:
-                # Mask was built but sampling raised — still update last_mask
-                # so the MASK output reflects what was attempted.
-                state["last_mask"] = _this_mask
+                # Kursat NOTE!!! 2026-06-10 — Misleading comment fix: corrected comment.
+                # This branch fires when _this_mask was set (mask was built and
+                # passed the None-guard) but _refined stayed None — meaning
+                # _refine_with_fine_upscaling returned the SAME latent object as
+                # `current` with an identity bbox, rather than a new tensor.
+                # It does NOT fire when sampling raises an exception: an uncaught
+                # exception from the GPU sampling calls above propagates out of
+                # run() entirely and never reaches this with-block.
+                # We still persist the mask so the MASK output socket reflects
+                # the shape that was used, but we do NOT append to history
+                # (nothing actually changed in the latent).
+                if _is_current_gen:
+                    state["last_mask"] = _this_mask
 
         out_latent = {"samples": current}
         ui_msg = {
