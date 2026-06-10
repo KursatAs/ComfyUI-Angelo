@@ -1216,6 +1216,18 @@ class AngeloRefine:
                 # older saved workflows don't shift their positional
                 # widgets_values; defaults to 0.
                 "redo_seq": ("INT", {"default": 0, "min": 0, "max": 0x7FFFFFFF}),
+
+                # Restore brush: when ON, clicks / paint strokes / detect masks
+                # restore the painted region back to the session base image via
+                # a feathered latent blend. Refine mode only; Smart modes ignore
+                # it. Declared LAST so older saved workflows do not shift their
+                # positional widgets_values.
+                "restore_mode": ("BOOLEAN", {"default": False,
+                                             "tooltip": "When ON, clicks and paint strokes restore "
+                                                        "the painted region back to the session base "
+                                                        "image (a feathered latent blend, no sampling). "
+                                                        "Refine mode only. Toggled via the Restore "
+                                                        "button on the toolbar."}),
             },
             "optional": {
                 # CLIP / text encoder for the Area Prompt. Optional —
@@ -1290,6 +1302,7 @@ class AngeloRefine:
             reroll_seq=0,
             seg_mask_png="",
             redo_seq=0,
+            restore_mode=False,
             latent=None,
             clip=None,
             unique_id=None,
@@ -1551,6 +1564,7 @@ class AngeloRefine:
         # very early return).
         _my_gen_token = -1        # will be overwritten inside the lock below
         _persistent_last_mask = None  # captured only when persistent_mask=True
+        _restore_source_latent = None  # captured under lock for Restore brush
 
         with node_lock:
             state = _STATE.get(node_id)
@@ -1642,6 +1656,11 @@ class AngeloRefine:
             # seg_mask_png) are empty — guards against JS clearing those values
             # between queue presses.
             _persistent_last_mask = state.get("last_mask") if persistent_mask else None
+            if bool(restore_mode) and inpainting_mode == "Refine":
+                _restore_source_latent = state.get("source_latent")
+                if _restore_source_latent is None and state.get("history"):
+                    hist_0 = state["history"][0]
+                    _restore_source_latent = hist_0[0] if isinstance(hist_0, tuple) else hist_0
 
         # --- Step 2: GPU sampling outside the lock ---
         # Source latent for every edit is the current cached latent, so all
@@ -1781,6 +1800,8 @@ class AngeloRefine:
 
                 _this_mask = mask  # capture for state write + MASK output
 
+                restore_now = bool(restore_mode) and inpainting_mode == "Refine"
+
                 # Area-prompt conditioning selection. When area_prompt is on AND a
                 # CLIP is connected, the refine uses the AREA text ONLY and NEVER
                 # the main prompt — even when the Area text is empty, in which case
@@ -1803,7 +1824,7 @@ class AngeloRefine:
                 if inpainting_mode == "Smart Guided Inpaint":
                     prefix = _GUIDED_LOCATION_PREFIXES.get(str(guided_location), "")
                     area_pos_text = prefix + area_pos_text
-                if area_prompt and clip is not None:
+                if area_prompt and clip is not None and not restore_now:
                     tokens_p = clip.tokenize(area_pos_text)
                     refine_positive = clip.encode_from_tokens_scheduled(tokens_p)
                     if str(area_text_negative).strip():
@@ -1862,7 +1883,24 @@ class AngeloRefine:
                         refine_positive, {"reference_latents": [reference_latent]}, append=True,
                     )
 
-                if fine_upscaling:
+                if restore_now:
+                    # Restore brush: heal the masked area back to the session
+                    # base, without sampling. Outside the feathered mask, keep
+                    # the current latent bit-exact. Shape mismatch is treated as
+                    # a no-op so Undo/Redo history is not polluted.
+                    src = _restore_source_latent
+                    if src is None or tuple(src.shape) != tuple(current.shape):
+                        src_shape = None if src is None else tuple(src.shape)
+                        print("[Angelo restore] base/current latent shape mismatch "
+                              f"({src_shape} vs {tuple(current.shape)}) - restore skipped")
+                    else:
+                        src = src.to(device=current.device, dtype=current.dtype)
+                        alpha = mask.to(device=current.device, dtype=current.dtype)
+                        while alpha.dim() < current.dim():
+                            alpha = alpha.unsqueeze(0)
+                        _refined = src * alpha + current * (1.0 - alpha)
+                        _refined_pixels = None
+                elif fine_upscaling:
                     _refined, _refined_pixels = _refine_with_fine_upscaling(
                         guider=guider, sampler=sampler, sigmas=sigmas,
                         vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,

@@ -541,6 +541,19 @@ function attachPreviewCanvas(node) {
     row1.appendChild(paintModeToggle);
     node._AngeloPaintModeToggle = paintModeToggle;
 
+    const restoreToggle = makeToggleButton("Restore", () => {
+        const w = findWidget(node, "restore_mode");
+        if (!w) return;
+        setWidget(w, !w.value);
+        syncRestoreToggle(node);
+    });
+    restoreToggle.title = "Restore brush — when ON, clicks and paint strokes restore the painted "
+        + "region back to the session's original base image instead of refining it. No sampling is "
+        + "run. Feather applies for a soft blend; works with clicks, Paint Mode strokes, and Detect "
+        + "masks. Refine mode only — Smart modes ignore it.";
+    row1.appendChild(restoreToggle);
+    node._AngeloRestoreToggle = restoreToggle;
+
     const fineUpscaleToggle = makeToggleButton("Xtra-Fine", () => {
         const w = findWidget(node, "fine_upscaling");
         if (!w) return;
@@ -643,7 +656,11 @@ function attachPreviewCanvas(node) {
     row2.appendChild(seedCtrlSelect);
     node._AngeloSeedCtrlSelect = seedCtrlSelect;
 
-    row2.appendChild(makeSeparator());
+    // Xtra-Fine value group (separator + MP/Max/Ctx Pad/Method). These
+    // values only affect sampling while Xtra-Fine is effectively ON.
+    const fineSep = makeSeparator();
+    row2.appendChild(fineSep);
+    node._AngeloFineSep = fineSep;
 
     const mpInput = makeNumberInput("MP", { min: 0.1, max: 4.0, step: 0.1, width: 50 }, (val) => {
         const w = findWidget(node, "min_megapixels");
@@ -3325,6 +3342,7 @@ const _TOGGLE_ON_COLORS = {
     green:  { bg: "rgba(30, 120, 80, 0.95)",  border: "rgba(140, 220, 170, 0.9)" },
     purple: { bg: "rgba(95, 50, 130, 0.95)",  border: "rgba(180, 140, 220, 0.9)" },
     teal:   { bg: "rgba(30, 110, 130, 0.95)", border: "rgba(140, 200, 220, 0.9)" },
+    amber:  { bg: "rgba(135, 90, 25, 0.95)",  border: "rgba(235, 185, 95, 0.9)" },
 };
 
 function syncPersistentMaskToggle(node) {
@@ -3351,6 +3369,15 @@ function syncPaintModeToggle(node) {
     _syncToggle(node._AngeloPaintModeToggle, findWidget(node, "paint_mode")?.value, _TOGGLE_ON_COLORS.teal);
 }
 
+function syncRestoreToggle(node) {
+    // Backend honours restore_mode in Refine only. Show OFF in Smart modes
+    // so the toolbar reflects the effective behavior, not a stale widget.
+    const effective = isAnySmartMode(node)
+        ? false
+        : findWidget(node, "restore_mode")?.value;
+    _syncToggle(node._AngeloRestoreToggle, effective, _TOGGLE_ON_COLORS.amber);
+}
+
 function syncFineUpscaleToggle(node) {
     // Backend forces fine_upscaling ON in Smart Inpaint and OFF in
     // Smart Guided Inpaint regardless of widget state — reflect that in
@@ -3360,6 +3387,18 @@ function syncFineUpscaleToggle(node) {
     else if (isSmartGuidedInpaintMode(node)) effective = false;
     else effective = findWidget(node, "fine_upscaling")?.value;
     _syncToggle(node._AngeloFineUpscaleToggle, effective, _TOGGLE_ON_COLORS.green);
+
+    const showFine = !!effective;
+    const fineGroup = [
+        [node._AngeloFineSep, ""],
+        [node._AngeloMpInput, "inline-flex"],
+        [node._AngeloMaxInput, "inline-flex"],
+        [node._AngeloCtxPadInput, "inline-flex"],
+        [node._AngeloMethodSelect, "inline-flex"],
+    ];
+    for (const [el, shown] of fineGroup) {
+        if (el) el.style.display = showFine ? shown : "none";
+    }
 }
 
 // Smart Inpaint mode hard-locks several params on the backend
@@ -3395,6 +3434,7 @@ function syncSmartInpaintLockedWidgets(node) {
         "_AngeloDenoiseInput",
         "_AngeloFineUpscaleToggle",
         "_AngeloPaintModeToggle",
+        "_AngeloRestoreToggle",
         "_AngeloClickRadiusInput",
         "_AngeloAreaPromptToggle",
         "_AngeloCtxPadInput",
@@ -3416,6 +3456,7 @@ function syncSmartInpaintLockedWidgets(node) {
     syncFineUpscaleToggle(node);
     syncAreaPromptToggle(node);
     syncPersistentMaskToggle(node);
+    syncRestoreToggle(node);
     syncAreaPromptVisibility(node);
     // Detect row hides in Smart Guided (no mask), shows in Refine/Smart Inpaint.
     syncDetectControls(node);
@@ -3655,6 +3696,7 @@ function syncAllToolbarControls(node) {
     syncPersistentMaskToggle(node);
     syncAreaPromptToggle(node);
     syncPaintModeToggle(node);
+    syncRestoreToggle(node);
     syncFineUpscaleToggle(node);
     syncClickRadiusInput(node);
     syncFeatherInput(node);
@@ -3807,6 +3849,8 @@ function hideMechanicalWidgets(node) {
         "reroll_seq",
         // Redo button — bumps to restore an edit that Undo removed
         "redo_seq",
+        // Restore brush — driven by the Restore toggle on the toolbar
+        "restore_mode",
         // Toolbar-driven (visible via the bar above the canvas)
         "persistent_mask", "area_prompt", "paint_mode", "fine_upscaling",
         "click_radius", "feather_radius", "denoise",
