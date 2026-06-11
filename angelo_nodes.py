@@ -26,11 +26,13 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import inspect
 import io
 import json
 import math
 import os
 import threading
+import time
 
 import numpy as np
 import torch
@@ -54,7 +56,7 @@ import nodes as comfy_nodes
 
 # Per-node state cache:
 #   unique_id -> {
-#     "history":   list[tuple[Tensor, Tensor | None]], # stack of (latent, pixels) (oldest first, current = [-1])
+#     "history":   list[tuple[Tensor, Tensor | None, Tensor | None]], # stack of (latent, pixels, mask) (oldest first, current = [-1])
 #     "click_seq": int,            # last processed click_seq from JS
 #     "undo_seq":  int,            # last processed undo_seq from JS
 #     "redo_seq":  int,            # last processed redo_seq from JS
@@ -90,6 +92,15 @@ def _node_lock(node_id: str) -> threading.Lock:
         if node_id not in _NODE_LOCKS:
             _NODE_LOCKS[node_id] = threading.Lock()
         return _NODE_LOCKS[node_id]
+
+
+def _prune_state() -> None:
+    """Evict the least-recently-used node-state entries when _STATE exceeds
+    _MAX_STATE_NODES.  Must be called while holding _STATE_LOCK."""
+    while len(_STATE) > _MAX_STATE_NODES:
+        oldest = min(_STATE, key=lambda nid: _STATE[nid].get("last_touch", 0.0))
+        del _STATE[oldest]
+        _NODE_LOCKS.pop(oldest, None)
 
 
 def _guider_sample(
@@ -138,10 +149,41 @@ def _guider_sample(
 
 def _guider_with_conds(guider, positive, negative):
     g = copy.copy(guider)
+    # Determine arity from the method signature before calling, so a
+    # TypeError raised *inside* set_conds (e.g. malformed conditioning
+    # data) is never confused with a wrong-argument-count error and
+    # silently swallowed.  We count required positional parameters
+    # (excluding self) to decide which overload to use.
+    _takes_two: bool | None = None
     try:
-        g.set_conds(positive, negative)  # comfy.samplers.CFGGuider
-    except TypeError:
-        g.set_conds(positive)  # comfy.samplers.BaseGuider / BasicGuider
+        _sig = inspect.signature(g.set_conds)
+        _n_req = sum(
+            1 for _p in _sig.parameters.values()
+            if _p.default is inspect.Parameter.empty
+            and _p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+        _takes_two = _n_req >= 2
+    except (ValueError, TypeError):
+        pass  # C extension or other un-introspectable callable — fall through
+
+    if _takes_two is True:
+        g.set_conds(positive, negative)   # comfy.samplers.CFGGuider
+    elif _takes_two is False:
+        g.set_conds(positive)             # comfy.samplers.BaseGuider / BasicGuider
+    else:
+        # Signature introspection failed — last resort: try/except on arity
+        # only.  Re-raise anything that isn't a call-signature mismatch.
+        try:
+            g.set_conds(positive, negative)
+        except TypeError as _exc:
+            _msg = str(_exc).lower()
+            if "argument" in _msg or "positional" in _msg or "takes" in _msg:
+                g.set_conds(positive)
+            else:
+                raise
     return g
 
 
@@ -162,6 +204,14 @@ def _truncate_sigmas_for_denoise(sigmas: torch.Tensor, denoise: float) -> torch.
 # 10 entries can therefore use up to ~176 MB per active node. Reduce this
 # value on low-VRAM / low-RAM systems.
 _HISTORY_CAP: int = 10
+
+# Maximum number of distinct node-state entries (_STATE / _NODE_LOCKS) to
+# keep in memory.  Deleted nodes, copied nodes, and reloaded workflows
+# accumulate stale entries that are never explicitly freed.  When this cap
+# is exceeded the least-recently-used entry is evicted.  100 covers every
+# realistic workflow; raise it if you routinely use more Angelo nodes in
+# one session.
+_MAX_STATE_NODES: int = 100
 
 # Valid resize methods for the Fine Upscaling crop. All routed through
 # comfy.utils.common_upscale which accepts both 4D image tensors and 4D
@@ -1443,7 +1493,7 @@ class AngeloRefine:
             # the control to "fixed".
             with _STATE_LOCK:
                 _STATE[node_id] = {
-                    "history": [(new_latent, None)],
+                    "history": [(new_latent, None, None)],
                     "click_seq": click_seq,
                     "undo_seq": undo_seq,
                     "redo_seq": redo_seq,
@@ -1461,7 +1511,9 @@ class AngeloRefine:
                     # Step 1 of each edit run so Step 3 can detect stale writes
                     # (see Risk 1 fix).
                     "gen_token": 0,
+                    "last_touch": time.time(),
                 }
+                _prune_state()
             out_latent = {"samples": new_latent}
             ui_msg = {
                 "Angelo_preview": [],
@@ -1501,6 +1553,8 @@ class AngeloRefine:
         # by `reset` / `new_loaded` above — so the fingerprint isn't needed.
         with _STATE_LOCK:
             state = _STATE.get(node_id)
+            if state is not None:
+                state["last_touch"] = time.time()
         fingerprint_changed = (
                 base_from_wired_latent
                 and state is not None
@@ -1522,7 +1576,7 @@ class AngeloRefine:
             # normally.
             with _STATE_LOCK:
                 _STATE[node_id] = {
-                    "history": [(incoming.clone(), None)],
+                    "history": [(incoming.clone(), None, None)],
                     "click_seq": click_seq,
                     "undo_seq": undo_seq,
                     "redo_seq": redo_seq,
@@ -1538,7 +1592,9 @@ class AngeloRefine:
                     # every explicit state reset so the counter stays consistent
                     # with the new session (see Risk 1 fix).
                     "gen_token": 0,
+                    "last_touch": time.time(),
                 }
+                _prune_state()
             state = _STATE[node_id]
 
         # ===== Edit Mode: per-node lock around all state mutations =====
@@ -1594,6 +1650,10 @@ class AngeloRefine:
                 # restoring the WRONG result. (Harmless no-op when the hook didn't
                 # bump it.)
                 state["click_seq"] = click_seq
+                # Restore last_mask to match the latent we're restoring to, so the
+                # MASK output socket stays consistent with the current latent.
+                _h = state["history"][-1]
+                state["last_mask"] = _h[2] if isinstance(_h, tuple) and len(_h) >= 3 else None
 
             # ===== Redo (#6): restore an entry Undo moved to the redo stack =====
             # A PURE restore — never re-samples — and runs BEFORE `current` is read
@@ -1610,6 +1670,9 @@ class AngeloRefine:
                         state["history"] = state["history"][-_HISTORY_CAP:]
                 state["redo_seq"] = redo_seq
                 state["click_seq"] = click_seq
+                # Restore last_mask from the entry we just re-applied.
+                _h = state["history"][-1]
+                state["last_mask"] = _h[2] if isinstance(_h, tuple) and len(_h) >= 3 else None
 
             # ===== Re-roll: redo the most recent edit with a fresh seed =====
             # The Re-roll button bumps reroll_seq (and sets a new seed) without
@@ -1628,7 +1691,10 @@ class AngeloRefine:
 
             hist_last = state["history"][-1]
             if isinstance(hist_last, tuple):
-                current, current_pixels = hist_last
+                # Handle both old 2-tuple (latent, pixels) and new 3-tuple
+                # (latent, pixels, mask) history entries transparently.
+                current = hist_last[0]
+                current_pixels = hist_last[1] if len(hist_last) > 1 else None
             else:
                 current = hist_last
                 current_pixels = None
@@ -1640,14 +1706,16 @@ class AngeloRefine:
                     and click_seq != state["click_seq"]
             )
 
-            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix: generation token.
-            # Increment under the lock so every overlapping run gets a unique
-            # monotonic token.  Step 3 refuses to write history if a newer run
-            # has already incremented past _my_gen_token, preventing an older
-            # slow GPU sample from appending its stale output after the newer
-            # result has already been committed.
-            state["gen_token"] = state.get("gen_token", 0) + 1
-            _my_gen_token = state["gen_token"]
+            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix (corrected): generation token.
+            # Increment ONLY when this run will actually do GPU sampling (new click
+            # or re-roll).  Incrementing unconditionally meant a no-op queue run
+            # (same click_seq, no reroll) would advance the token past an in-flight
+            # real edit's token, causing the real edit's Step 3 guard to discard
+            # its result.  Now only real edits consume a token, so no-op runs can
+            # never invalidate a concurrent real edit.
+            if new_click or reroll_now:
+                state["gen_token"] = state.get("gen_token", 0) + 1
+            _my_gen_token = state.get("gen_token", 0)
 
             # Kursat NOTE!!! 2026-06-10 — Risk 3 fix: backend persistent-mask
             # capture.  Snapshot state["last_mask"] under the lock so the mask-
@@ -1914,6 +1982,14 @@ class AngeloRefine:
                         positive=refine_positive, negative=refine_negative,
                         denoise=denoise, callback=callback, disable_pbar=disable_pbar,
                     )
+                    # _refine_with_fine_upscaling returns (current, current_pixels)
+                    # unchanged when the mask bbox is empty or degenerate (all-black
+                    # raster mask, polygon entirely off-image, etc.).  Detect this by
+                    # identity check and treat it as a no-op so Step 3 never appends
+                    # a phantom history entry with no visible change.
+                    if _refined is refine_source:
+                        _refined = None
+                        _refined_pixels = None
                 else:
                     noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
                     refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
@@ -1944,7 +2020,9 @@ class AngeloRefine:
             _is_current_gen = (state.get("gen_token") == _my_gen_token)
             if _refined is not None:
                 if _is_current_gen:
-                    state["history"].append((_refined, _refined_pixels))
+                    # Store (latent, pixels, mask) so Undo/Redo can restore the
+                    # mask that was active when this edit was made (Issue 3 fix).
+                    state["history"].append((_refined, _refined_pixels, _this_mask))
                     if len(state["history"]) > _HISTORY_CAP:
                         state["history"] = state["history"][-_HISTORY_CAP:]
                     # A genuine new edit (click or re-roll) invalidates the redo branch.
