@@ -85,6 +85,16 @@ _STATE_LOCK = threading.RLock()
 # Per-node lock registry — protected by _STATE_LOCK itself.
 _NODE_LOCKS: dict[str, threading.Lock] = {}
 
+# Kursat NOTE!!! 2026-06-11 — Risk 2 fix (prune-during-execution): active-run counter.
+# Active-run counter: tracks how many run() calls for a node are currently
+# between Step 1 (lock acquired, state read) and Step 3 (results written).
+# Between those two locked sections the per-node lock is NOT held, so
+# _NODE_LOCKS[nid].locked() would return False even while sampling is active.
+# This counter is incremented under _STATE_LOCK just before Step 1 and
+# decremented under _STATE_LOCK just after Step 3, giving _prune_state() a
+# reliable signal to skip nodes that are in flight.  Protected by _STATE_LOCK.
+_ACTIVE_RUNS: dict[str, int] = {}
+
 
 def _node_lock(node_id: str) -> threading.Lock:
     """Return (creating if needed) a per-node Lock for state mutations."""
@@ -95,12 +105,61 @@ def _node_lock(node_id: str) -> threading.Lock:
 
 
 def _prune_state() -> None:
-    """Evict the least-recently-used node-state entries when _STATE exceeds
-    _MAX_STATE_NODES.  Must be called while holding _STATE_LOCK."""
+    """Kursat NOTE!!! 2026-06-11 — Risk 2 fix (prune-during-execution): safe LRU eviction.
+    Evict the least-recently-used node-state entries when _STATE exceeds
+    _MAX_STATE_NODES.  Must be called while holding _STATE_LOCK.
+
+    A node is considered safe to evict only when it has no active run in
+    progress (checked via _ACTIVE_RUNS) AND its per-node lock is not held.
+    The per-node lock guards Step 1 and Step 3; _ACTIVE_RUNS guards the gap
+    between them (Step 2 — GPU sampling — during which the lock is released).
+
+    Stuck-counter fallback: if an unhandled exception during Step 2 prevents
+    the _ACTIVE_RUNS decrement, the counter stays at >0 indefinitely.  To
+    avoid keeping stale state forever, nodes whose last_touch is older than
+    _PRUNE_STUCK_TIMEOUT_S are evicted regardless of their counter.
+    """
+    _STUCK_TIMEOUT = 300.0  # seconds — treat counter as stuck after 5 min of inactivity
+    _now = time.time()
+
     while len(_STATE) > _MAX_STATE_NODES:
-        oldest = min(_STATE, key=lambda nid: _STATE[nid].get("last_touch", 0.0))
+        # Prefer candidates with no active run and unlocked per-node lock.
+        candidates = {
+            nid: st for nid, st in _STATE.items()
+            if _ACTIVE_RUNS.get(nid, 0) == 0
+            and not (_NODE_LOCKS.get(nid) and _NODE_LOCKS[nid].locked())
+        }
+        if not candidates:
+            # All nodes appear active.  Fall back to evicting any node whose
+            # last_touch is old enough that its _ACTIVE_RUNS counter is likely
+            # stuck (exception during Step 2 skipped the decrement).
+            candidates = {
+                nid: st for nid, st in _STATE.items()
+                if (_now - st.get("last_touch", 0.0)) > _STUCK_TIMEOUT
+            }
+        if not candidates:
+            # Every node is either genuinely active or recently touched — give up.
+            break
+        oldest = min(candidates, key=lambda nid: _STATE[nid].get("last_touch", 0.0))
         del _STATE[oldest]
         _NODE_LOCKS.pop(oldest, None)
+        _ACTIVE_RUNS.pop(oldest, None)
+
+
+def _active_run_inc(node_id: str) -> None:
+    """Mark a node as in-flight for pruning purposes."""
+    with _STATE_LOCK:
+        _ACTIVE_RUNS[node_id] = _ACTIVE_RUNS.get(node_id, 0) + 1
+
+
+def _active_run_dec(node_id: str) -> None:
+    """Clear one in-flight mark. Safe to call after partial failures."""
+    with _STATE_LOCK:
+        _cnt = _ACTIVE_RUNS.get(node_id, 0) - 1
+        if _cnt > 0:
+            _ACTIVE_RUNS[node_id] = _cnt
+        else:
+            _ACTIVE_RUNS.pop(node_id, None)
 
 
 def _guider_sample(
@@ -149,6 +208,7 @@ def _guider_sample(
 
 def _guider_with_conds(guider, positive, negative):
     g = copy.copy(guider)
+    # Kursat NOTE!!! 2026-06-11 — Risk 5 fix (TypeError masking) + variadic-signature edge case:
     # Determine arity from the method signature before calling, so a
     # TypeError raised *inside* set_conds (e.g. malformed conditioning
     # data) is never confused with a wrong-argument-count error and
@@ -157,20 +217,32 @@ def _guider_with_conds(guider, positive, negative):
     _takes_two: bool | None = None
     try:
         _sig = inspect.signature(g.set_conds)
-        _n_req = sum(
-            1 for _p in _sig.parameters.values()
-            if _p.default is inspect.Parameter.empty
-            and _p.kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
+        _params = _sig.parameters.values()
+        # A VAR_POSITIONAL (*args) or VAR_KEYWORD (**kwargs) parameter means
+        # the callable accepts any number of arguments, so two-arg call is
+        # always safe.  Without that, count accepted positional parameters.
+        # (Previously _n_req == 0 for *args signatures was mis-classified as
+        # "one-argument guider" because 0 >= 2 is False — now detected first.)
+        _has_var = any(
+            _p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for _p in _params
         )
-        _takes_two = _n_req >= 2
+        if _has_var:
+            _takes_two = True  # variadic — two-arg call is always accepted
+        else:
+            _n_pos = sum(
+                1 for _p in _params
+                if _p.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+            _takes_two = _n_pos >= 2
     except (ValueError, TypeError):
         pass  # C extension or other un-introspectable callable — fall through
 
     if _takes_two is True:
-        g.set_conds(positive, negative)   # comfy.samplers.CFGGuider
+        g.set_conds(positive, negative)   # comfy.samplers.CFGGuider / variadic
     elif _takes_two is False:
         g.set_conds(positive)             # comfy.samplers.BaseGuider / BasicGuider
     else:
@@ -205,6 +277,7 @@ def _truncate_sigmas_for_denoise(sigmas: torch.Tensor, denoise: float) -> torch.
 # value on low-VRAM / low-RAM systems.
 _HISTORY_CAP: int = 10
 
+# Kursat NOTE!!! 2026-06-11 — Risk 4 fix (unbounded _STATE growth): LRU cap.
 # Maximum number of distinct node-state entries (_STATE / _NODE_LOCKS) to
 # keep in memory.  Deleted nodes, copied nodes, and reloaded workflows
 # accumulate stale entries that are never explicitly freed.  When this cap
@@ -1511,9 +1584,10 @@ class AngeloRefine:
                     # Step 1 of each edit run so Step 3 can detect stale writes
                     # (see Risk 1 fix).
                     "gen_token": 0,
+                    # Kursat NOTE!!! 2026-06-11 — Risk 4 fix (LRU): timestamp for _prune_state().
                     "last_touch": time.time(),
                 }
-                _prune_state()
+                _prune_state()  # Kursat NOTE!!! 2026-06-11 — Risk 4 fix: evict oldest if over cap.
             out_latent = {"samples": new_latent}
             ui_msg = {
                 "Angelo_preview": [],
@@ -1554,6 +1628,9 @@ class AngeloRefine:
         with _STATE_LOCK:
             state = _STATE.get(node_id)
             if state is not None:
+                # Kursat NOTE!!! 2026-06-11 — Risk 4 fix (LRU touch): update last_touch
+                # on every Edit Mode run so the LRU eviction in _prune_state() always
+                # favours genuinely idle / orphaned nodes over active ones.
                 state["last_touch"] = time.time()
         fingerprint_changed = (
                 base_from_wired_latent
@@ -1592,9 +1669,10 @@ class AngeloRefine:
                     # every explicit state reset so the counter stays consistent
                     # with the new session (see Risk 1 fix).
                     "gen_token": 0,
+                    # Kursat NOTE!!! 2026-06-11 — Risk 4 fix (LRU): timestamp for _prune_state().
                     "last_touch": time.time(),
                 }
-                _prune_state()
+                _prune_state()  # Kursat NOTE!!! 2026-06-11 — Risk 4 fix: evict oldest if over cap.
             state = _STATE[node_id]
 
         # ===== Edit Mode: per-node lock around all state mutations =====
@@ -1650,7 +1728,8 @@ class AngeloRefine:
                 # restoring the WRONG result. (Harmless no-op when the hook didn't
                 # bump it.)
                 state["click_seq"] = click_seq
-                # Restore last_mask to match the latent we're restoring to, so the
+                # Kursat NOTE!!! 2026-06-11 — Risk 3 fix (Undo/Redo mask sync): restore
+                # last_mask to match the latent we're restoring to, so the
                 # MASK output socket stays consistent with the current latent.
                 _h = state["history"][-1]
                 state["last_mask"] = _h[2] if isinstance(_h, tuple) and len(_h) >= 3 else None
@@ -1670,7 +1749,8 @@ class AngeloRefine:
                         state["history"] = state["history"][-_HISTORY_CAP:]
                 state["redo_seq"] = redo_seq
                 state["click_seq"] = click_seq
-                # Restore last_mask from the entry we just re-applied.
+                # Kursat NOTE!!! 2026-06-11 — Risk 3 fix (Undo/Redo mask sync): restore
+                # last_mask from the entry we just re-applied.
                 _h = state["history"][-1]
                 state["last_mask"] = _h[2] if isinstance(_h, tuple) and len(_h) >= 3 else None
 
@@ -1691,7 +1771,8 @@ class AngeloRefine:
 
             hist_last = state["history"][-1]
             if isinstance(hist_last, tuple):
-                # Handle both old 2-tuple (latent, pixels) and new 3-tuple
+                # Kursat NOTE!!! 2026-06-11 — Risk 3 fix (history tuple format): handle
+                # both old 2-tuple (latent, pixels) and new 3-tuple
                 # (latent, pixels, mask) history entries transparently.
                 current = hist_last[0]
                 current_pixels = hist_last[1] if len(hist_last) > 1 else None
@@ -1706,15 +1787,6 @@ class AngeloRefine:
                     and click_seq != state["click_seq"]
             )
 
-            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix (corrected): generation token.
-            # Increment ONLY when this run will actually do GPU sampling (new click
-            # or re-roll).  Incrementing unconditionally meant a no-op queue run
-            # (same click_seq, no reroll) would advance the token past an in-flight
-            # real edit's token, causing the real edit's Step 3 guard to discard
-            # its result.  Now only real edits consume a token, so no-op runs can
-            # never invalidate a concurrent real edit.
-            if new_click or reroll_now:
-                state["gen_token"] = state.get("gen_token", 0) + 1
             _my_gen_token = state.get("gen_token", 0)
 
             # Kursat NOTE!!! 2026-06-10 — Risk 3 fix: backend persistent-mask
@@ -1729,6 +1801,28 @@ class AngeloRefine:
                 if _restore_source_latent is None and state.get("history"):
                     hist_0 = state["history"][0]
                     _restore_source_latent = hist_0[0] if isinstance(hist_0, tuple) else hist_0
+
+        def _claim_generation_token() -> bool:
+            """Reserve a generation token only once a real edit will run."""
+            nonlocal _my_gen_token
+            with node_lock:
+                state_for_token = _STATE.get(node_id)
+                if state_for_token is None:
+                    return False
+                state_for_token["gen_token"] = state_for_token.get("gen_token", 0) + 1
+                _my_gen_token = state_for_token["gen_token"]
+                return True
+
+        def _release_generation_token_if_current() -> None:
+            """Undo this run's token claim when it fails before Step 3."""
+            with node_lock:
+                state_for_token = _STATE.get(node_id)
+                if (
+                        state_for_token is not None
+                        and _my_gen_token > 0
+                        and state_for_token.get("gen_token") == _my_gen_token
+                ):
+                    state_for_token["gen_token"] = _my_gen_token - 1
 
         # --- Step 2: GPU sampling outside the lock ---
         # Source latent for every edit is the current cached latent, so all
@@ -1746,6 +1840,7 @@ class AngeloRefine:
         _refined = None
         _refined_pixels = None
         _this_mask = None
+        _active_claimed = False
 
         if new_click or reroll_now:
             # A re-roll re-runs the same mask widgets from the popped pre-
@@ -1866,6 +1961,12 @@ class AngeloRefine:
                     mask = _gaussian_blur_2d(mask, max(0.5, sigma_latent))
                     mask = mask.clamp(0.0, 1.0)
 
+                if _mask_bbox_latent(mask) is None:
+                    # Empty masks are no-op edits. Do not claim a generation
+                    # token and do not update history/last_mask.
+                    mask = None
+
+            if mask is not None:
                 _this_mask = mask  # capture for state write + MASK output
 
                 restore_now = bool(restore_mode) and inpainting_mode == "Refine"
@@ -1962,66 +2063,81 @@ class AngeloRefine:
                         print("[Angelo restore] base/current latent shape mismatch "
                               f"({src_shape} vs {tuple(current.shape)}) - restore skipped")
                     else:
-                        src = src.to(device=current.device, dtype=current.dtype)
-                        alpha = mask.to(device=current.device, dtype=current.dtype)
-                        while alpha.dim() < current.dim():
-                            alpha = alpha.unsqueeze(0)
-                        _refined = src * alpha + current * (1.0 - alpha)
-                        _refined_pixels = None
+                        if _claim_generation_token():
+                            _active_run_inc(node_id)
+                            _active_claimed = True
+                            try:
+                                src = src.to(device=current.device, dtype=current.dtype)
+                                alpha = mask.to(device=current.device, dtype=current.dtype)
+                                while alpha.dim() < current.dim():
+                                    alpha = alpha.unsqueeze(0)
+                                _refined = src * alpha + current * (1.0 - alpha)
+                                _refined_pixels = None
+                            except Exception:
+                                _release_generation_token_if_current()
+                                _active_run_dec(node_id)
+                                _active_claimed = False
+                                raise
                 elif fine_upscaling:
-                    _refined, _refined_pixels = _refine_with_fine_upscaling(
-                        guider=guider, sampler=sampler, sigmas=sigmas,
-                        vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
-                        scale_x=scale_x, scale_y=scale_y,
-                        target_mp=float(min_megapixels),
-                        max_linear=float(max_upscale),
-                        resize_method=str(resize_method),
-                        context_pad_pixel=int(fine_context_pad),
-                        inpainting_mode=str(inpainting_mode),
-                        seed=this_seed,
-                        positive=refine_positive, negative=refine_negative,
-                        denoise=denoise, callback=callback, disable_pbar=disable_pbar,
-                    )
-                    # _refine_with_fine_upscaling returns (current, current_pixels)
-                    # unchanged when the mask bbox is empty or degenerate (all-black
-                    # raster mask, polygon entirely off-image, etc.).  Detect this by
-                    # identity check and treat it as a no-op so Step 3 never appends
-                    # a phantom history entry with no visible change.
-                    if _refined is refine_source:
-                        _refined = None
-                        _refined_pixels = None
+                    if _claim_generation_token():
+                        _active_run_inc(node_id)
+                        _active_claimed = True
+                        try:
+                            _refined, _refined_pixels = _refine_with_fine_upscaling(
+                                guider=guider, sampler=sampler, sigmas=sigmas,
+                                vae=vae, current=refine_source, current_pixels=current_pixels, mask=mask,
+                                scale_x=scale_x, scale_y=scale_y,
+                                target_mp=float(min_megapixels),
+                                max_linear=float(max_upscale),
+                                resize_method=str(resize_method),
+                                context_pad_pixel=int(fine_context_pad),
+                                inpainting_mode=str(inpainting_mode),
+                                seed=this_seed,
+                                positive=refine_positive, negative=refine_negative,
+                                denoise=denoise, callback=callback, disable_pbar=disable_pbar,
+                            )
+                        except Exception:
+                            _release_generation_token_if_current()
+                            _active_run_dec(node_id)
+                            _active_claimed = False
+                            raise
                 else:
                     noise = comfy.sample.prepare_noise(refine_source, this_seed, None)
                     refine_sigmas = _truncate_sigmas_for_denoise(sigmas, denoise)
                     temp_g = _guider_with_conds(guider, refine_positive, refine_negative)
-                    _refined = _guider_sample(
-                        temp_g, noise, refine_source, sampler, refine_sigmas,
-                        denoise_mask=mask,
-                        callback=callback,
-                        disable_pbar=disable_pbar,
-                        seed=this_seed,
-                    )
-                    # _guider_sample already moves the result to intermediate_device().
-                    _refined_pixels = None
+                    if _claim_generation_token():
+                        _active_run_inc(node_id)
+                        _active_claimed = True
+                        try:
+                            _refined = _guider_sample(
+                                temp_g, noise, refine_source, sampler, refine_sigmas,
+                                denoise_mask=mask,
+                                callback=callback,
+                                disable_pbar=disable_pbar,
+                                seed=this_seed,
+                            )
+                            # _guider_sample already moves the result to intermediate_device().
+                            _refined_pixels = None
+                        except Exception:
+                            _release_generation_token_if_current()
+                            _active_run_dec(node_id)
+                            _active_claimed = False
+                            raise
 
         # --- Step 3: write results back to state under per-node lock ---
         with node_lock:
             state = _STATE.get(node_id)
-            # Kursat NOTE!!! 2026-06-10 — Risk 1 fix: generation token guard.
-            # If a newer concurrent run incremented state["gen_token"] past
-            # _my_gen_token while this run was on the GPU, that newer run has
-            # already written its (more up-to-date) result to history.  Appending
-            # THIS run's stale output on top would corrupt the undo stack by
-            # burying the newer result one Undo step back.  Skipping the history
-            # write here leaves the newer run's commit intact.  The local
-            # `current` / output-socket values are still updated so the ComfyUI
-            # pipeline gets this run's tensors — only the persistent history state
-            # is protected.
-            _is_current_gen = (state.get("gen_token") == _my_gen_token)
+            # Generation token guard. Tokens are claimed only after the mask
+            # has been proven non-empty and just before the run performs a real
+            # restore/sample. No-op clicks never advance gen_token, so they
+            # cannot invalidate an older in-flight real edit.
+            _is_current_gen = (state is not None and state.get("gen_token") == _my_gen_token)
+
             if _refined is not None:
                 if _is_current_gen:
-                    # Store (latent, pixels, mask) so Undo/Redo can restore the
-                    # mask that was active when this edit was made (Issue 3 fix).
+                    # Kursat NOTE!!! 2026-06-11 — Risk 3 fix (history tuple format): store
+                    # (latent, pixels, mask) so Undo/Redo can restore the
+                    # mask that was active when this edit was made.
                     state["history"].append((_refined, _refined_pixels, _this_mask))
                     if len(state["history"]) > _HISTORY_CAP:
                         state["history"] = state["history"][-_HISTORY_CAP:]
@@ -2049,11 +2165,21 @@ class AngeloRefine:
                 if _is_current_gen:
                     state["last_mask"] = _this_mask
 
+        with _STATE_LOCK:
+            if _active_claimed:
+                _active_run_dec(node_id)
+                _active_claimed = False
+            # Kursat NOTE!!! 2026-06-11 — Risk 2 fix (prune-during-execution): state=None guard.
+            # Re-fetch state under _STATE_LOCK in case _prune_state() removed it
+            # during Step 2 (should not happen with _ACTIVE_RUNS, but guards
+            # against future refactors or stuck-counter fallback eviction).
+            state = _STATE.get(node_id) or state
+
         out_latent = {"samples": current}
         ui_msg = {
             "Angelo_preview": [],
             "Angelo_mode": ["Edit Mode"],
-            "Angelo_refine_seed_at_run": [int(state.get("refine_seed_at_run", seed))],
+            "Angelo_refine_seed_at_run": [int((state or {}).get("refine_seed_at_run", seed))],
         }
 
         if current_pixels is not None:
@@ -2070,19 +2196,26 @@ class AngeloRefine:
         # eviction under _HISTORY_CAP). source_latent is set at every base
         # (re)establishment; the history[0] fallback only covers pre-existing
         # in-memory state from before this feature.
-        source_image = state.get("source_pixels")
+        source_image = (state or {}).get("source_pixels")
         if source_image is None:
-            src_latent = state.get("source_latent")
-            if src_latent is None:
+            src_latent = (state or {}).get("source_latent")
+            if src_latent is None and state is not None and state.get("history"):
                 h0 = state["history"][0]
                 src_latent = h0[0] if isinstance(h0, tuple) else h0
-            source_image = _vae_decode(vae, src_latent)
-            state["source_pixels"] = source_image
+            if src_latent is not None:
+                source_image = _vae_decode(vae, src_latent)
+                if state is not None:
+                    state["source_pixels"] = source_image
+            else:
+                # Kursat NOTE!!! 2026-06-11 — Risk 2 fix (prune-during-execution): state=None guard.
+                # Fallback: decode the current latent as the source image when
+                # state was evicted during Step 2 and src_latent is unavailable.
+                source_image, _ = _decode_to_preview(vae, current)
 
         # MASK output: return the most recently computed refine mask so
         # downstream nodes (compositing, secondary inpaint, etc.) can use it.
         # last_mask is [1, H, W] float; squeeze to [H, W] for the MASK type.
-        out_mask = state.get("last_mask")
+        out_mask = (state or {}).get("last_mask")
         if out_mask is None:
             out_mask = torch.zeros(
                 (current.shape[-2], current.shape[-1]),
